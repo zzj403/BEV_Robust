@@ -1,0 +1,4 @@
+[submodule "TransFusion"]
+	path = TransFusion
+	url = https://github.com/XuyangBai/TransFusion
+	branch = master
