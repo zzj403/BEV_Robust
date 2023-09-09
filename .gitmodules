@@ -2,3 +2,7 @@
 	path = TransFusion
 	url = https://github.com/XuyangBai/TransFusion
 	branch = master
+[submodule "bevfusion"]
+	path = bevfusion
+	url = https://github.com/mit-han-lab/bevfusion
+	branch = main
