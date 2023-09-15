@@ -4,12 +4,15 @@
 [submodule "bevfusion"]
 	path = bevfusion
 	url = https://github.com/mit-han-lab/bevfusion
-[submodule "BEVFormer"]
-	path = BEVFormer
-	url = https://github.com/fundamentalvision/BEVFormer
 [submodule "detr3d"]
 	path = detr3d
 	url = https://github.com/WangYueFt/detr3d
 [submodule "BEVDet"]
 	path = BEVDet
 	url = https://github.com/HuangJunJie2017/BEVDet
+[submodule "BEVFormer"]
+	path = BEVFormer
+	url = https://github.com/fundamentalvision/BEVFormer
+[submodule "mmdetection3d"]
+	path = mmdetection3d
+	url = https://github.com/open-mmlab/mmdetection3d
