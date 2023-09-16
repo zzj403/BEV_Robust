@@ -61,7 +61,7 @@ Dataset and checkpoints prepare please refer to each model repo.
 Please refer to [Code_demo.md](./Code_demo.md).
 
 ## Other Things
-To save the work during paper preparing, we use BEVDepth implementation in BEVDet repo. Because the pytorch_lightning used in original BEVDepth repo is too hard to modified with adversarial features. 
+To save the work during paper preparing, we use BEVDepth implementation in BEVDet repo. Because the pytorch_lightning used in original BEVDepth repo is too hard to modify to add adversarial features. 
 Thanks to [BEVDet](https://github.com/HuangJunJie2017/BEVDet) which give us another implementation for BEVDepth. And we still thanks the bravo work of [BEVDepth](https://github.com/Megvii-BaseDetection/BEVDepth).
 
 ## Acknowledgement
