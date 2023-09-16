@@ -1,0 +1,2138 @@
+diff --git a/extend/__init__.py b/extend/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/extend/custom_func.py b/extend/custom_func.py
+new file mode 100644
+index 0000000..85e248f
+--- /dev/null
++++ b/extend/custom_func.py
+@@ -0,0 +1,85 @@
++# only for detr3d
++
++import torch
++import torchvision
++import torchvision.transforms as transforms
++import torch.nn.functional as F
++from torchvision.utils import save_image
++import copy
++
++def custom_data_preprocess(data):
++    for _key in data:
++        data[_key] = data[_key][0]
++    return data
++
++def custom_data_postprocess_eval(data):
++    data.pop('gt_bboxes_3d', None)
++    data.pop('gt_labels_3d', None)
++    for _key in data:
++        data[_key] = [data[_key]]
++    return data
++
++def custom_data_work(data):
++    metas = data['img_metas']._data[0][0]
++    img_path_list = metas['filename']
++    img_org_np = metas['img_org']
++    img_processed = data['img']._data[0].clone()
++    gt_labels_3d = data['gt_labels_3d']._data[0][0]
++    return metas, img_path_list, img_org_np, img_processed, gt_labels_3d
++
++
++
++def custom_result_postprocess(result):
++    result[0]['pts_bbox']['boxes_3d'].tensor = result[0]['pts_bbox']['boxes_3d'].tensor.cpu()
++    result[0]['pts_bbox']['scores_3d'] = result[0]['pts_bbox']['scores_3d'].cpu()
++    result[0]['pts_bbox']['labels_3d'] = result[0]['pts_bbox']['labels_3d'].cpu()
++    return result
++
++
++def custom_img_read_from_img_org(img_org_np, device):
++    img_org_np_255_bgr_hwcn_uint8 = img_org_np # mmcv 读取 BGR 转 numpy
++    img_org_tensor_bgr_255_hwcn = torch.from_numpy(img_org_np_255_bgr_hwcn_uint8).float()
++    img_org_tensor_bgr_255 = img_org_tensor_bgr_255_hwcn.permute(3,2,0,1)
++    img_org_tensor_bgr = (img_org_tensor_bgr_255/255.).to(device) # 6chw
++    img_org_tensor_rgb = img_org_tensor_bgr[:,[2,1,0]]
++    img_tensor_rgb_6chw_0to1 = img_org_tensor_rgb
++    return img_tensor_rgb_6chw_0to1
++
++
++def custom_differentiable_transform(img_tensor_rgb_6chw_0to1, img_metas):
++
++    """Alternative Data Preparation for Original Model
++
++    Args:
++        img_tensor (torch.tensor): (6xCxHxW), tensors of original imgs 
++    """
++
++    assert len(img_tensor_rgb_6chw_0to1.shape) == 4
++    assert img_tensor_rgb_6chw_0to1.shape[0] == 6
++    assert img_tensor_rgb_6chw_0to1.shape[1] == 3
++    assert img_tensor_rgb_6chw_0to1.max() <= 1.
++    assert img_tensor_rgb_6chw_0to1.min() >= 0.
++    assert img_tensor_rgb_6chw_0to1.dtype == torch.float32
++    assert img_tensor_rgb_6chw_0to1.is_cuda
++    device = img_tensor_rgb_6chw_0to1.device
++
++    # detr3d 用的是 bgr
++    # {'mean': array([103.53 , 116.28 , 123.675], dtype=float32), 
++    # 'std': array([1., 1., 1.], dtype=float32), 'to_rgb': False}
++    img_tensor_255 = img_tensor_rgb_6chw_0to1[:,[2,1,0]] * 255.
++
++    mean_tensor = torch.tensor(img_metas['img_norm_cfg']['mean'],dtype=torch.float32).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).to(device)
++    std_tensor = torch.tensor(img_metas['img_norm_cfg']['std'],  dtype=torch.float32).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).to(device)
++    normalized_img_tensor = (img_tensor_255 - mean_tensor) / std_tensor
++    # for detr3d, there is no resize operation
++    img_h, img_w = img_metas['ori_shape'][:2]
++    pad_h, pad_w = img_metas['pad_shape'][0][:2]
++    PadModule = torch.nn.ZeroPad2d(padding=(0, pad_w-img_w, 0, pad_h-img_h))
++    padded_img_tensor = PadModule(normalized_img_tensor.unsqueeze(0))
++    return padded_img_tensor
++
++
++def custom_image_data_give(data, image_ready):
++    data_copy = copy.deepcopy(data)
++    data_copy['img']._data[0] = image_ready
++    return data_copy
+diff --git a/extend_common b/extend_common
+new file mode 120000
+index 0000000..0633dd9
+--- /dev/null
++++ b/extend_common
+@@ -0,0 +1 @@
++../extend_common/
+\ No newline at end of file
+diff --git a/projects/__init__.py b/projects/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/projects/configs/detr3d/detr3d_res101_gridmask_adv.py b/projects/configs/detr3d/detr3d_res101_gridmask_adv.py
+new file mode 100644
+index 0000000..9ffda2d
+--- /dev/null
++++ b/projects/configs/detr3d/detr3d_res101_gridmask_adv.py
+@@ -0,0 +1,243 @@
++_base_ = [
++    '../../../mmdetection3d/configs/_base_/datasets/nus-3d.py',
++    '../../../mmdetection3d/configs/_base_/default_runtime.py'
++]
++
++# add fp16 setting for save GPU memory
++fp16 = dict(loss_scale=32.)
++
++plugin=True
++plugin_dir='projects/mmdet3d_plugin/'
++
++# If point cloud range is changed, the models should also change their point
++# cloud range accordingly
++point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
++voxel_size = [0.2, 0.2, 8]
++
++img_norm_cfg = dict(
++    mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
++# For nuScenes we usually do 10-class detection
++class_names = [
++    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
++    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
++]
++
++input_modality = dict(
++    use_lidar=False,
++    use_camera=True,
++    use_radar=False,
++    use_map=False,
++    use_external=False)
++
++model = dict(
++    type='Detr3D',
++    use_grid_mask=True,
++    img_backbone=dict(
++        type='ResNet',
++        depth=101,
++        num_stages=4,
++        out_indices=(0, 1, 2, 3),
++        frozen_stages=1,
++        norm_cfg=dict(type='BN2d', requires_grad=False),
++        norm_eval=True,
++        style='caffe',
++        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False),
++        stage_with_dcn=(False, False, True, True)),
++    img_neck=dict(
++        type='FPN',
++        in_channels=[256, 512, 1024, 2048],
++        out_channels=256,
++        start_level=1,
++        add_extra_convs='on_output',
++        num_outs=4,
++        relu_before_extra_convs=True),
++    pts_bbox_head=dict(
++        type='Detr3DHead',
++        num_query=900,
++        num_classes=10,
++        in_channels=256,
++        sync_cls_avg_factor=True,
++        with_box_refine=True,
++        as_two_stage=False,
++        transformer=dict(
++            type='Detr3DTransformer',
++            decoder=dict(
++                type='Detr3DTransformerDecoder',
++                num_layers=6,
++                return_intermediate=True,
++                transformerlayers=dict(
++                    type='DetrTransformerDecoderLayer',
++                    attn_cfgs=[
++                        dict(
++                            type='MultiheadAttention',
++                            embed_dims=256,
++                            num_heads=8,
++                            dropout=0.1),
++                        dict(
++                            type='Detr3DCrossAtten',
++                            pc_range=point_cloud_range,
++                            num_points=1,
++                            embed_dims=256)
++                    ],
++                    feedforward_channels=512,
++                    ffn_dropout=0.1,
++                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
++                                     'ffn', 'norm')))),
++        bbox_coder=dict(
++            type='NMSFreeCoder',
++            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
++            pc_range=point_cloud_range,
++            max_num=300,
++            voxel_size=voxel_size,
++            num_classes=10), 
++        positional_encoding=dict(
++            type='SinePositionalEncoding',
++            num_feats=128,
++            normalize=True,
++            offset=-0.5),
++        loss_cls=dict(
++            type='FocalLoss',
++            use_sigmoid=True,
++            gamma=2.0,
++            alpha=0.25,
++            loss_weight=2.0),
++        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
++        loss_iou=dict(type='GIoULoss', loss_weight=0.0)),
++    # model training and testing settings
++    train_cfg=dict(pts=dict(
++        grid_size=[512, 512, 1],
++        voxel_size=voxel_size,
++        point_cloud_range=point_cloud_range,
++        out_size_factor=4,
++        assigner=dict(
++            type='HungarianAssigner3D',
++            cls_cost=dict(type='FocalLossCost', weight=2.0),
++            reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
++            iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
++            pc_range=point_cloud_range))))
++
++dataset_type = 'CustomNuScenesDataset'
++data_root = 'data/nuscenes/'
++
++file_client_args = dict(backend='disk')
++
++db_sampler = dict(
++    data_root=data_root,
++    info_path=data_root + 'nuscenes_dbinfos_train.pkl',
++    rate=1.0,
++    prepare=dict(
++        filter_by_difficulty=[-1],
++        filter_by_min_points=dict(
++            car=5,
++            truck=5,
++            bus=5,
++            trailer=5,
++            construction_vehicle=5,
++            traffic_cone=5,
++            barrier=5,
++            motorcycle=5,
++            bicycle=5,
++            pedestrian=5)),
++    classes=class_names,
++    sample_groups=dict(
++        car=2,
++        truck=3,
++        construction_vehicle=7,
++        bus=4,
++        trailer=6,
++        barrier=2,
++        motorcycle=6,
++        bicycle=6,
++        pedestrian=2,
++        traffic_cone=2),
++    points_loader=dict(
++        type='LoadPointsFromFile',
++        coord_type='LIDAR',
++        load_dim=5,
++        use_dim=[0, 1, 2, 3, 4],
++        file_client_args=file_client_args))
++
++train_pipeline = [
++    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
++    dict(type='PhotoMetricDistortionMultiViewImage'),
++    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
++    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
++    dict(type='ObjectNameFilter', classes=class_names),
++    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
++    dict(type='PadMultiViewImage', size_divisor=32),
++    dict(type='DefaultFormatBundle3D', class_names=class_names),
++    dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img'])
++]
++test_pipeline = [
++    dict(type='LoadMultiViewImageFromFilesImgOrg', to_float32=True),
++    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
++    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
++    dict(type='PadMultiViewImage', size_divisor=32),
++    dict(
++        type='MultiScaleFlipAug3D',
++        img_scale=(1333, 800),
++        pts_scale_ratio=1,
++        flip=False,
++        transforms=[
++            dict(
++                type='DefaultFormatBundle3D',
++                class_names=class_names,
++                with_label=True),
++            dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img'],
++                 meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
++                            'depth2img', 'cam2img', 'pad_shape',
++                            'scale_factor', 'flip', 'pcd_horizontal_flip',
++                            'pcd_vertical_flip', 'box_mode_3d', 'box_type_3d',
++                            'img_norm_cfg', 'pcd_trans', 'sample_idx',
++                            'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
++                            'transformation_3d_flow', 
++                            'img_org'
++                            )
++            )
++        ])
++]
++
++
++data = dict(
++    samples_per_gpu=1,
++    workers_per_gpu=4,
++    train=dict(
++        type=dataset_type,
++        data_root=data_root,
++        ann_file=data_root + 'nuscenes_infos_train.pkl',
++        pipeline=train_pipeline,
++        classes=class_names,
++        modality=input_modality,
++        test_mode=False,
++        use_valid_flag=True,
++        # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
++        # and box_type_3d='Depth' in sunrgbd and scannet dataset.
++        box_type_3d='LiDAR'),
++    val=dict(
++        type=dataset_type,
++        pipeline=test_pipeline, classes=class_names, modality=input_modality),
++    test=dict(
++        type=dataset_type,
++        pipeline=test_pipeline, classes=class_names, modality=input_modality))
++
++optimizer = dict(
++    type='AdamW', 
++    lr=2e-4,
++    paramwise_cfg=dict(
++        custom_keys={
++            'img_backbone': dict(lr_mult=0.1),
++        }),
++    weight_decay=0.01)
++optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
++# learning policy
++lr_config = dict(
++    policy='CosineAnnealing',
++    warmup='linear',
++    warmup_iters=500,
++    warmup_ratio=1.0 / 3,
++    min_lr_ratio=1e-3)
++total_epochs = 24
++evaluation = dict(interval=2, pipeline=test_pipeline)
++
++runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
++load_from='ckpts/fcos3d.pth'
+diff --git a/projects/mmdet3d_plugin/apis_common b/projects/mmdet3d_plugin/apis_common
+new file mode 120000
+index 0000000..d498da4
+--- /dev/null
++++ b/projects/mmdet3d_plugin/apis_common
+@@ -0,0 +1 @@
++../../../apis_common/
+\ No newline at end of file
+diff --git a/projects/mmdet3d_plugin/datasets/nuscenes_dataset.py b/projects/mmdet3d_plugin/datasets/nuscenes_dataset.py
+index 1ec4cf2..02514dd 100644
+--- a/projects/mmdet3d_plugin/datasets/nuscenes_dataset.py
++++ b/projects/mmdet3d_plugin/datasets/nuscenes_dataset.py
+@@ -1,6 +1,9 @@
+ import numpy as np
+ from mmdet.datasets import DATASETS
+ from mmdet3d.datasets import NuScenesDataset
++import orjson
++import time
++import json
+ 
+ 
+ @DATASETS.register_module()
+@@ -72,5 +75,89 @@ class CustomNuScenesDataset(NuScenesDataset):
+         if not self.test_mode:
+             annos = self.get_ann_info(index)
+             input_dict['ann_info'] = annos
++        else:
++            annos = self.get_ann_info(index)
++            input_dict['ann_info'] = annos
+ 
+         return input_dict
++
++
++    def _format_bbox(self, results, jsonfile_prefix=None):
++        """Convert the results to the standard format.
++
++        Args:
++            results (list[dict]): Testing results of the dataset.
++            jsonfile_prefix (str): The prefix of the output jsonfile.
++                You can specify the output directory/filename by
++                modifying the jsonfile_prefix. Default: None.
++
++        Returns:
++            str: Path of the output json file.
++        """
++        nusc_annos = {}
++        mapped_class_names = self.CLASSES
++
++
++
++        from mmdet3d.datasets.nuscenes_dataset import output_to_nusc_box,lidar_nusc_box_to_global
++
++        print('Start to convert detection format...')
++        for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
++            annos = []
++            boxes = output_to_nusc_box(det)
++            sample_token = self.data_infos[sample_id]['token']
++            boxes = lidar_nusc_box_to_global(self.data_infos[sample_id], boxes,
++                                             mapped_class_names,
++                                             self.eval_detection_configs,
++                                             self.eval_version)
++            for i, box in enumerate(boxes):
++                name = mapped_class_names[box.label]
++                if np.sqrt(box.velocity[0]**2 + box.velocity[1]**2) > 0.2:
++                    if name in [
++                            'car',
++                            'construction_vehicle',
++                            'bus',
++                            'truck',
++                            'trailer',
++                    ]:
++                        attr = 'vehicle.moving'
++                    elif name in ['bicycle', 'motorcycle']:
++                        attr = 'cycle.with_rider'
++                    else:
++                        attr = NuScenesDataset.DefaultAttribute[name]
++                else:
++                    if name in ['pedestrian']:
++                        attr = 'pedestrian.standing'
++                    elif name in ['bus']:
++                        attr = 'vehicle.stopped'
++                    else:
++                        attr = NuScenesDataset.DefaultAttribute[name]
++
++                nusc_anno = dict(
++                    sample_token=sample_token,
++                    translation=box.center.tolist(),
++                    size=box.wlh.tolist(),
++                    rotation=box.orientation.elements.tolist(),
++                    velocity=box.velocity[:2].tolist(),
++                    detection_name=name,
++                    detection_score=box.score,
++                    attribute_name=attr)
++                annos.append(nusc_anno)
++            nusc_annos[sample_token] = annos
++        nusc_submissions = {
++            'meta': self.modality,
++            'results': nusc_annos,
++        }
++
++        mmcv.mkdir_or_exist(jsonfile_prefix)
++        res_path = osp.join(jsonfile_prefix, 'results_nusc.json')
++        # print('Results writes to', res_path)
++        # mmcv.dump(nusc_submissions, res_path)
++
++        print('Results writes to', res_path,'by orjson')
++        start = time.time()
++        with open(res_path, "wb") as f:    
++            f.write(orjson.dumps(nusc_submissions))
++            print("by orjson in", time.time()-start,'s')
++
++        return res_path
+\ No newline at end of file
+diff --git a/projects/mmdet3d_plugin/datasets/pipelines/__init__.py b/projects/mmdet3d_plugin/datasets/pipelines/__init__.py
+index a246a61..228772c 100755
+--- a/projects/mmdet3d_plugin/datasets/pipelines/__init__.py
++++ b/projects/mmdet3d_plugin/datasets/pipelines/__init__.py
+@@ -3,6 +3,7 @@ from .transform_3d import (
+     PhotoMetricDistortionMultiViewImage, CropMultiViewImage,
+     RandomScaleImageMultiViewImage,
+     HorizontalRandomFlipMultiViewImage)
++from .loading import LoadMultiViewImageFromFilesImgOrg
+ 
+ __all__ = [
+     'PadMultiViewImage', 'NormalizeMultiviewImage', 
+diff --git a/projects/mmdet3d_plugin/datasets/pipelines/loading.py b/projects/mmdet3d_plugin/datasets/pipelines/loading.py
+new file mode 100644
+index 0000000..0764550
+--- /dev/null
++++ b/projects/mmdet3d_plugin/datasets/pipelines/loading.py
+@@ -0,0 +1,73 @@
++# Copyright (c) OpenMMLab. All rights reserved.
++import mmcv
++import numpy as np
++
++from mmdet3d.core.points import BasePoints, get_points_type
++from mmdet.datasets.builder import PIPELINES
++from mmdet.datasets.pipelines import LoadAnnotations, LoadImageFromFile
++
++
++# copy from mmdet3d LoadMultiViewImageFromFiles
++@PIPELINES.register_module()
++class LoadMultiViewImageFromFilesImgOrg(object):
++    """Load multi channel images from a list of separate channel files.
++
++    Expects results['img_filename'] to be a list of filenames.
++
++    Args:
++        to_float32 (bool): Whether to convert the img to float32.
++            Defaults to False.
++        color_type (str): Color type of the file. Defaults to 'unchanged'.
++    """
++
++    def __init__(self, to_float32=False, color_type='unchanged'):
++        self.to_float32 = to_float32
++        self.color_type = color_type
++
++    def __call__(self, results):
++        """Call function to load multi-view image from files.
++
++        Args:
++            results (dict): Result dict containing multi-view image filenames.
++
++        Returns:
++            dict: The result dict containing the multi-view image data. \
++                Added keys and values are described below.
++
++                - filename (str): Multi-view image filenames.
++                - img (np.ndarray): Multi-view image arrays.
++                - img_shape (tuple[int]): Shape of multi-view image arrays.
++                - ori_shape (tuple[int]): Shape of original image arrays.
++                - pad_shape (tuple[int]): Shape of padded image arrays.
++                - scale_factor (float): Scale factor.
++                - img_norm_cfg (dict): Normalization configuration of images.
++        """
++        filename = results['img_filename']
++        # img is of shape (h, w, c, num_views)
++        img = np.stack(
++            [mmcv.imread(name, self.color_type) for name in filename], axis=-1)
++        if self.to_float32:
++            img = img.astype(np.float32)
++        results['filename'] = filename
++        # unravel to list, see `DefaultFormatBundle` in formating.py
++        # which will transpose each image separately and then stack into array
++        results['img'] = [img[..., i] for i in range(img.shape[-1])]
++        results['img_shape'] = img.shape
++        results['ori_shape'] = img.shape
++        # Set initial values for default meta_keys
++        results['pad_shape'] = img.shape
++        results['scale_factor'] = 1.0
++        num_channels = 1 if len(img.shape) < 3 else img.shape[2]
++        results['img_norm_cfg'] = dict(
++            mean=np.zeros(num_channels, dtype=np.float32),
++            std=np.ones(num_channels, dtype=np.float32),
++            to_rgb=False)
++        results['img_org'] = img
++        return results
++
++    def __repr__(self):
++        """str: Return a string that describes the module."""
++        repr_str = self.__class__.__name__
++        repr_str += f'(to_float32={self.to_float32}, '
++        repr_str += f"color_type='{self.color_type}')"
++        return repr_str
+diff --git a/tools/test_fgsm_img_launcher.py b/tools/test_fgsm_img_launcher.py
+new file mode 100755
+index 0000000..7399ebb
+--- /dev/null
++++ b/tools/test_fgsm_img_launcher.py
+@@ -0,0 +1,254 @@
++# Copyright (c) OpenMMLab. All rights reserved.
++import argparse
++import mmcv
++import os
++import sys
++sys_path = os.path.abspath(".")
++sys.path.append(sys_path)
++import torch
++import warnings
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
++                         wrap_fp16_model)
++
++from projects.mmdet3d_plugin.apis_common.test_fgsm_img import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description='MMDet test (and eval) a model')
++    parser.add_argument('config', help='test config file path')
++    parser.add_argument('checkpoint', help='checkpoint file')
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('eps255', help='eps of fgsm in 0-255')
++    parser.add_argument('--out', help='output result file in pickle format')
++    parser.add_argument(
++        '--fuse-conv-bn',
++        action='store_true',
++        help='Whether to fuse conv and bn, this will slightly increase'
++        'the inference speed')
++    parser.add_argument(
++        '--format-only',
++        action='store_true',
++        help='Format the output results without perform evaluation. It is'
++        'useful when you want to format the result to a specific format and '
++        'submit it to the test server')
++    parser.add_argument(
++        '--eval',
++        type=str,
++        nargs='+',
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
++    parser.add_argument('--show', action='store_true', help='show results')
++    parser.add_argument(
++        '--show-dir', help='directory where results will be saved')
++    parser.add_argument(
++        '--gpu-collect',
++        action='store_true',
++        help='whether to use gpu to collect results.')
++    parser.add_argument(
++        '--tmpdir',
++        help='tmp directory used for collecting results from multiple '
++        'workers, available when gpu-collect is not specified')
++    parser.add_argument('--seed', type=int, default=0, help='random seed')
++    parser.add_argument(
++        '--deterministic',
++        action='store_true',
++        help='whether to set deterministic options for CUDNN backend.')
++    parser.add_argument(
++        '--cfg-options',
++        nargs='+',
++        action=DictAction,
++        help='override some settings in the used config, the key-value pair '
++        'in xxx=yyy format will be merged into config file. If the value to '
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        'Note that the quotation marks are necessary and that no white space '
++        'is allowed.')
++    parser.add_argument(
++        '--options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function (deprecate), '
++        'change to --eval-options instead.')
++    parser.add_argument(
++        '--eval-options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function')
++    parser.add_argument(
++        '--launcher',
++        choices=['none', 'pytorch', 'slurm', 'mpi'],
++        default='none',
++        help='job launcher')
++    parser.add_argument('--local_rank', type=int, default=0)
++    args = parser.parse_args()
++    if 'LOCAL_RANK' not in os.environ:
++        os.environ['LOCAL_RANK'] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            '--options and --eval-options cannot be both specified, '
++            '--options is deprecated in favor of --eval-options')
++    if args.options:
++        warnings.warn('--options is deprecated in favor of --eval-options')
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++
++    # assert args.out or args.eval or args.format_only or args.show \
++    #     or args.show_dir, \
++    #     ('Please specify at least one operation (save/eval/format/show the '
++    #      'results / save the results) with the argument "--out", "--eval"'
++    #      ', "--format-only", "--show" or "--show-dir"')
++
++    if args.eval and args.format_only:
++        raise ValueError('--eval and --format_only cannot be both specified')
++
++    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
++        raise ValueError('The output file must be a pkl file.')
++
++    cfg = Config.fromfile(args.config)
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # import modules from string list.
++    if cfg.get('custom_imports', None):
++        from mmcv.utils import import_modules_from_strings
++        import_modules_from_strings(**cfg['custom_imports'])
++    
++    # import modules from plguin/xx, registry will be updated
++    if hasattr(cfg, 'plugin'):
++        if cfg.plugin:
++            import importlib
++            if hasattr(cfg, 'plugin_dir'):
++                plugin_dir = cfg.plugin_dir
++                _module_dir = os.path.dirname(plugin_dir)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++            else:
++                # import dir is the dirpath for the config file
++                _module_dir = os.path.dirname(args.config)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++
++    # set cudnn_benchmark
++    if cfg.get('cudnn_benchmark', False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(
++                cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop('samples_per_gpu', 1) for ds_cfg in cfg.data.test])
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    if args.launcher == 'none':
++        distributed = False
++    else:
++        distributed = True
++        init_dist(args.launcher, **cfg.dist_params)
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False)
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'), train_cfg=cfg.get('train_cfg'))
++    fp16_cfg = cfg.get('fp16', None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if 'CLASSES' in checkpoint.get('meta', {}):
++        model.CLASSES = checkpoint['meta']['CLASSES']
++    else:
++        model.CLASSES = dataset.CLASSES
++    # palette for visualization in segmentation tasks
++    if 'PALETTE' in checkpoint.get('meta', {}):
++        model.PALETTE = checkpoint['meta']['PALETTE']
++    elif hasattr(dataset, 'PALETTE'):
++        # segmentation dataset has `PALETTE` attribute
++        model.PALETTE = dataset.PALETTE
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.eps255,
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False)
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
++                                 args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f'\nwriting results to {args.out}')
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get('evaluation', {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
++                    'rule'
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/test_patch_class_launcher.py b/tools/test_patch_class_launcher.py
+new file mode 100755
+index 0000000..4cfb3fd
+--- /dev/null
++++ b/tools/test_patch_class_launcher.py
+@@ -0,0 +1,256 @@
++# Copyright (c) OpenMMLab. All rights reserved.
++import argparse
++import mmcv
++import os
++import sys
++sys_path = os.path.abspath(".")
++sys.path.append(sys_path)
++import torch
++import warnings
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
++                         wrap_fp16_model)
++
++from projects.mmdet3d_plugin.apis_common.test_patch_class import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description='MMDet test (and eval) a model')
++    parser.add_argument('config', help='test config file path')
++    parser.add_argument('checkpoint', help='checkpoint file')
++    parser.add_argument('patch_save_prefix', help='save patch_save file dir')
++    parser.add_argument('area_rate_str', help='area rate of patch')
++    parser.add_argument('optim_lr', help='optim_lr of attack')
++    parser.add_argument('--out', help='output result file in pickle format')
++    parser.add_argument(
++        '--fuse-conv-bn',
++        action='store_true',
++        help='Whether to fuse conv and bn, this will slightly increase'
++        'the inference speed')
++    parser.add_argument(
++        '--format-only',
++        action='store_true',
++        help='Format the output results without perform evaluation. It is'
++        'useful when you want to format the result to a specific format and '
++        'submit it to the test server')
++    parser.add_argument(
++        '--eval',
++        type=str,
++        nargs='+',
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
++    parser.add_argument('--show', action='store_true', help='show results')
++    parser.add_argument(
++        '--show-dir', help='directory where results will be saved')
++    parser.add_argument(
++        '--gpu-collect',
++        action='store_true',
++        help='whether to use gpu to collect results.')
++    parser.add_argument(
++        '--tmpdir',
++        help='tmp directory used for collecting results from multiple '
++        'workers, available when gpu-collect is not specified')
++    parser.add_argument('--seed', type=int, default=0, help='random seed')
++    parser.add_argument(
++        '--deterministic',
++        action='store_true',
++        help='whether to set deterministic options for CUDNN backend.')
++    parser.add_argument(
++        '--cfg-options',
++        nargs='+',
++        action=DictAction,
++        help='override some settings in the used config, the key-value pair '
++        'in xxx=yyy format will be merged into config file. If the value to '
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        'Note that the quotation marks are necessary and that no white space '
++        'is allowed.')
++    parser.add_argument(
++        '--options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function (deprecate), '
++        'change to --eval-options instead.')
++    parser.add_argument(
++        '--eval-options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function')
++    parser.add_argument(
++        '--launcher',
++        choices=['none', 'pytorch', 'slurm', 'mpi'],
++        default='none',
++        help='job launcher')
++    parser.add_argument('--local_rank', type=int, default=0)
++    args = parser.parse_args()
++    if 'LOCAL_RANK' not in os.environ:
++        os.environ['LOCAL_RANK'] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            '--options and --eval-options cannot be both specified, '
++            '--options is deprecated in favor of --eval-options')
++    if args.options:
++        warnings.warn('--options is deprecated in favor of --eval-options')
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++
++    # assert args.out or args.eval or args.format_only or args.show \
++    #     or args.show_dir, \
++    #     ('Please specify at least one operation (save/eval/format/show the '
++    #      'results / save the results) with the argument "--out", "--eval"'
++    #      ', "--format-only", "--show" or "--show-dir"')
++
++    if args.eval and args.format_only:
++        raise ValueError('--eval and --format_only cannot be both specified')
++
++    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
++        raise ValueError('The output file must be a pkl file.')
++
++    cfg = Config.fromfile(args.config)
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # import modules from string list.
++    if cfg.get('custom_imports', None):
++        from mmcv.utils import import_modules_from_strings
++        import_modules_from_strings(**cfg['custom_imports'])
++    
++    # import modules from plguin/xx, registry will be updated
++    if hasattr(cfg, 'plugin'):
++        if cfg.plugin:
++            import importlib
++            if hasattr(cfg, 'plugin_dir'):
++                plugin_dir = cfg.plugin_dir
++                _module_dir = os.path.dirname(plugin_dir)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++            else:
++                # import dir is the dirpath for the config file
++                _module_dir = os.path.dirname(args.config)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++
++    # set cudnn_benchmark
++    if cfg.get('cudnn_benchmark', False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(
++                cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop('samples_per_gpu', 1) for ds_cfg in cfg.data.test])
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    if args.launcher == 'none':
++        distributed = False
++    else:
++        distributed = True
++        init_dist(args.launcher, **cfg.dist_params)
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False)
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'), train_cfg=cfg.get('train_cfg'))
++    fp16_cfg = cfg.get('fp16', None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if 'CLASSES' in checkpoint.get('meta', {}):
++        model.CLASSES = checkpoint['meta']['CLASSES']
++    else:
++        model.CLASSES = dataset.CLASSES
++    # palette for visualization in segmentation tasks
++    if 'PALETTE' in checkpoint.get('meta', {}):
++        model.PALETTE = checkpoint['meta']['PALETTE']
++    elif hasattr(dataset, 'PALETTE'):
++        # segmentation dataset has `PALETTE` attribute
++        model.PALETTE = dataset.PALETTE
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.patch_save_prefix,
++                                  args.area_rate_str,
++                                  args.optim_lr
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False)
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
++                                 args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f'\nwriting results to {args.out}')
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get('evaluation', {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
++                    'rule'
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/test_patch_instance_launcher.py b/tools/test_patch_instance_launcher.py
+new file mode 100755
+index 0000000..22b9db5
+--- /dev/null
++++ b/tools/test_patch_instance_launcher.py
+@@ -0,0 +1,256 @@
++# Copyright (c) OpenMMLab. All rights reserved.
++import argparse
++import mmcv
++import os
++import sys
++sys_path = os.path.abspath(".")
++sys.path.append(sys_path)
++import torch
++import warnings
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
++                         wrap_fp16_model)
++
++from projects.mmdet3d_plugin.apis_common.test_patch_instance import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description='MMDet test (and eval) a model')
++    parser.add_argument('config', help='test config file path')
++    parser.add_argument('checkpoint', help='checkpoint file')
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('mask_code', help='mask area of instance patch')
++    parser.add_argument('step', help='step of attack')
++    parser.add_argument('--out', help='output result file in pickle format')
++    parser.add_argument(
++        '--fuse-conv-bn',
++        action='store_true',
++        help='Whether to fuse conv and bn, this will slightly increase'
++        'the inference speed')
++    parser.add_argument(
++        '--format-only',
++        action='store_true',
++        help='Format the output results without perform evaluation. It is'
++        'useful when you want to format the result to a specific format and '
++        'submit it to the test server')
++    parser.add_argument(
++        '--eval',
++        type=str,
++        nargs='+',
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
++    parser.add_argument('--show', action='store_true', help='show results')
++    parser.add_argument(
++        '--show-dir', help='directory where results will be saved')
++    parser.add_argument(
++        '--gpu-collect',
++        action='store_true',
++        help='whether to use gpu to collect results.')
++    parser.add_argument(
++        '--tmpdir',
++        help='tmp directory used for collecting results from multiple '
++        'workers, available when gpu-collect is not specified')
++    parser.add_argument('--seed', type=int, default=0, help='random seed')
++    parser.add_argument(
++        '--deterministic',
++        action='store_true',
++        help='whether to set deterministic options for CUDNN backend.')
++    parser.add_argument(
++        '--cfg-options',
++        nargs='+',
++        action=DictAction,
++        help='override some settings in the used config, the key-value pair '
++        'in xxx=yyy format will be merged into config file. If the value to '
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        'Note that the quotation marks are necessary and that no white space '
++        'is allowed.')
++    parser.add_argument(
++        '--options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function (deprecate), '
++        'change to --eval-options instead.')
++    parser.add_argument(
++        '--eval-options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function')
++    parser.add_argument(
++        '--launcher',
++        choices=['none', 'pytorch', 'slurm', 'mpi'],
++        default='none',
++        help='job launcher')
++    parser.add_argument('--local_rank', type=int, default=0)
++    args = parser.parse_args()
++    if 'LOCAL_RANK' not in os.environ:
++        os.environ['LOCAL_RANK'] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            '--options and --eval-options cannot be both specified, '
++            '--options is deprecated in favor of --eval-options')
++    if args.options:
++        warnings.warn('--options is deprecated in favor of --eval-options')
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++
++    # assert args.out or args.eval or args.format_only or args.show \
++    #     or args.show_dir, \
++    #     ('Please specify at least one operation (save/eval/format/show the '
++    #      'results / save the results) with the argument "--out", "--eval"'
++    #      ', "--format-only", "--show" or "--show-dir"')
++
++    if args.eval and args.format_only:
++        raise ValueError('--eval and --format_only cannot be both specified')
++
++    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
++        raise ValueError('The output file must be a pkl file.')
++
++    cfg = Config.fromfile(args.config)
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # import modules from string list.
++    if cfg.get('custom_imports', None):
++        from mmcv.utils import import_modules_from_strings
++        import_modules_from_strings(**cfg['custom_imports'])
++    
++    # import modules from plguin/xx, registry will be updated
++    if hasattr(cfg, 'plugin'):
++        if cfg.plugin:
++            import importlib
++            if hasattr(cfg, 'plugin_dir'):
++                plugin_dir = cfg.plugin_dir
++                _module_dir = os.path.dirname(plugin_dir)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++            else:
++                # import dir is the dirpath for the config file
++                _module_dir = os.path.dirname(args.config)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++
++    # set cudnn_benchmark
++    if cfg.get('cudnn_benchmark', False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(
++                cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop('samples_per_gpu', 1) for ds_cfg in cfg.data.test])
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    if args.launcher == 'none':
++        distributed = False
++    else:
++        distributed = True
++        init_dist(args.launcher, **cfg.dist_params)
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False)
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'), train_cfg=cfg.get('train_cfg'))
++    fp16_cfg = cfg.get('fp16', None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if 'CLASSES' in checkpoint.get('meta', {}):
++        model.CLASSES = checkpoint['meta']['CLASSES']
++    else:
++        model.CLASSES = dataset.CLASSES
++    # palette for visualization in segmentation tasks
++    if 'PALETTE' in checkpoint.get('meta', {}):
++        model.PALETTE = checkpoint['meta']['PALETTE']
++    elif hasattr(dataset, 'PALETTE'):
++        # segmentation dataset has `PALETTE` attribute
++        model.PALETTE = dataset.PALETTE
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.mask_code,
++                                  args.step
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False)
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
++                                 args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f'\nwriting results to {args.out}')
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get('evaluation', {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
++                    'rule'
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/test_patch_overlap_launcher.py b/tools/test_patch_overlap_launcher.py
+new file mode 100755
+index 0000000..c019bb7
+--- /dev/null
++++ b/tools/test_patch_overlap_launcher.py
+@@ -0,0 +1,260 @@
++# Copyright (c) OpenMMLab. All rights reserved.
++import argparse
++import mmcv
++import os
++import sys
++sys_path = os.path.abspath(".")
++sys.path.append(sys_path)
++import torch
++import warnings
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
++                         wrap_fp16_model)
++
++from projects.mmdet3d_plugin.apis_common.test_patch_overlap import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description='MMDet test (and eval) a model')
++    parser.add_argument('config', help='test config file path')
++    parser.add_argument('checkpoint', help='checkpoint file')
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('area_rate_str', help='area rate of patch')
++    parser.add_argument('optim_lr', help='optim_lr of attack')
++    parser.add_argument('optim_step', help='optim_lr of attack')
++    parser.add_argument('--index-min', type=int, default=0)      # for multi-gpu split dataset
++    parser.add_argument('--index-max', type=int, default=100000) # for multi-gpu split dataset
++    parser.add_argument('--out', help='output result file in pickle format')
++    parser.add_argument(
++        '--fuse-conv-bn',
++        action='store_true',
++        help='Whether to fuse conv and bn, this will slightly increase'
++        'the inference speed')
++    parser.add_argument(
++        '--format-only',
++        action='store_true',
++        help='Format the output results without perform evaluation. It is'
++        'useful when you want to format the result to a specific format and '
++        'submit it to the test server')
++    parser.add_argument(
++        '--eval',
++        type=str,
++        nargs='+',
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
++    parser.add_argument('--show', action='store_true', help='show results')
++    parser.add_argument(
++        '--show-dir', help='directory where results will be saved')
++    parser.add_argument(
++        '--gpu-collect',
++        action='store_true',
++        help='whether to use gpu to collect results.')
++    parser.add_argument(
++        '--tmpdir',
++        help='tmp directory used for collecting results from multiple '
++        'workers, available when gpu-collect is not specified')
++    parser.add_argument('--seed', type=int, default=0, help='random seed')
++    parser.add_argument(
++        '--deterministic',
++        action='store_true',
++        help='whether to set deterministic options for CUDNN backend.')
++    parser.add_argument(
++        '--cfg-options',
++        nargs='+',
++        action=DictAction,
++        help='override some settings in the used config, the key-value pair '
++        'in xxx=yyy format will be merged into config file. If the value to '
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        'Note that the quotation marks are necessary and that no white space '
++        'is allowed.')
++    parser.add_argument(
++        '--options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function (deprecate), '
++        'change to --eval-options instead.')
++    parser.add_argument(
++        '--eval-options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function')
++    parser.add_argument(
++        '--launcher',
++        choices=['none', 'pytorch', 'slurm', 'mpi'],
++        default='none',
++        help='job launcher')
++    parser.add_argument('--local_rank', type=int, default=0)
++    args = parser.parse_args()
++    if 'LOCAL_RANK' not in os.environ:
++        os.environ['LOCAL_RANK'] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            '--options and --eval-options cannot be both specified, '
++            '--options is deprecated in favor of --eval-options')
++    if args.options:
++        warnings.warn('--options is deprecated in favor of --eval-options')
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++
++    # assert args.out or args.eval or args.format_only or args.show \
++    #     or args.show_dir, \
++    #     ('Please specify at least one operation (save/eval/format/show the '
++    #      'results / save the results) with the argument "--out", "--eval"'
++    #      ', "--format-only", "--show" or "--show-dir"')
++
++    if args.eval and args.format_only:
++        raise ValueError('--eval and --format_only cannot be both specified')
++
++    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
++        raise ValueError('The output file must be a pkl file.')
++
++    cfg = Config.fromfile(args.config)
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # import modules from string list.
++    if cfg.get('custom_imports', None):
++        from mmcv.utils import import_modules_from_strings
++        import_modules_from_strings(**cfg['custom_imports'])
++    
++    # import modules from plguin/xx, registry will be updated
++    if hasattr(cfg, 'plugin'):
++        if cfg.plugin:
++            import importlib
++            if hasattr(cfg, 'plugin_dir'):
++                plugin_dir = cfg.plugin_dir
++                _module_dir = os.path.dirname(plugin_dir)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++            else:
++                # import dir is the dirpath for the config file
++                _module_dir = os.path.dirname(args.config)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++
++    # set cudnn_benchmark
++    if cfg.get('cudnn_benchmark', False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(
++                cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop('samples_per_gpu', 1) for ds_cfg in cfg.data.test])
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    if args.launcher == 'none':
++        distributed = False
++    else:
++        distributed = True
++        init_dist(args.launcher, **cfg.dist_params)
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False)
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'), train_cfg=cfg.get('train_cfg'))
++    fp16_cfg = cfg.get('fp16', None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if 'CLASSES' in checkpoint.get('meta', {}):
++        model.CLASSES = checkpoint['meta']['CLASSES']
++    else:
++        model.CLASSES = dataset.CLASSES
++    # palette for visualization in segmentation tasks
++    if 'PALETTE' in checkpoint.get('meta', {}):
++        model.PALETTE = checkpoint['meta']['PALETTE']
++    elif hasattr(dataset, 'PALETTE'):
++        # segmentation dataset has `PALETTE` attribute
++        model.PALETTE = dataset.PALETTE
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.area_rate_str,
++                                  args.optim_lr,
++                                  args.optim_step
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False)
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
++                                 args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f'\nwriting results to {args.out}')
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get('evaluation', {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
++                    'rule'
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/test_patch_temporal_launcher.py b/tools/test_patch_temporal_launcher.py
+new file mode 100755
+index 0000000..d5ac1c3
+--- /dev/null
++++ b/tools/test_patch_temporal_launcher.py
+@@ -0,0 +1,262 @@
++# Copyright (c) OpenMMLab. All rights reserved.
++import argparse
++import mmcv
++import os
++import sys
++sys_path = os.path.abspath(".")
++sys.path.append(sys_path)
++import torch
++import warnings
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
++                         wrap_fp16_model)
++
++from projects.mmdet3d_plugin.apis_common.test_patch_temporal import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description='MMDet test (and eval) a model')
++    parser.add_argument('config', help='test config file path')
++    parser.add_argument('checkpoint', help='checkpoint file')
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('area_rate_str', help='area rate of patch')
++    parser.add_argument('optim_lr', help='optim_lr of attack')
++    parser.add_argument('optim_step', help='optim_lr of attack')
++    parser.add_argument('--index-min', type=int, default=0)      # for multi-gpu split dataset
++    parser.add_argument('--index-max', type=int, default=100000) # for multi-gpu split dataset
++    parser.add_argument('--out', help='output result file in pickle format')
++    parser.add_argument(
++        '--fuse-conv-bn',
++        action='store_true',
++        help='Whether to fuse conv and bn, this will slightly increase'
++        'the inference speed')
++    parser.add_argument(
++        '--format-only',
++        action='store_true',
++        help='Format the output results without perform evaluation. It is'
++        'useful when you want to format the result to a specific format and '
++        'submit it to the test server')
++    parser.add_argument(
++        '--eval',
++        type=str,
++        nargs='+',
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
++    parser.add_argument('--show', action='store_true', help='show results')
++    parser.add_argument(
++        '--show-dir', help='directory where results will be saved')
++    parser.add_argument(
++        '--gpu-collect',
++        action='store_true',
++        help='whether to use gpu to collect results.')
++    parser.add_argument(
++        '--tmpdir',
++        help='tmp directory used for collecting results from multiple '
++        'workers, available when gpu-collect is not specified')
++    parser.add_argument('--seed', type=int, default=0, help='random seed')
++    parser.add_argument(
++        '--deterministic',
++        action='store_true',
++        help='whether to set deterministic options for CUDNN backend.')
++    parser.add_argument(
++        '--cfg-options',
++        nargs='+',
++        action=DictAction,
++        help='override some settings in the used config, the key-value pair '
++        'in xxx=yyy format will be merged into config file. If the value to '
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        'Note that the quotation marks are necessary and that no white space '
++        'is allowed.')
++    parser.add_argument(
++        '--options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function (deprecate), '
++        'change to --eval-options instead.')
++    parser.add_argument(
++        '--eval-options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function')
++    parser.add_argument(
++        '--launcher',
++        choices=['none', 'pytorch', 'slurm', 'mpi'],
++        default='none',
++        help='job launcher')
++    parser.add_argument('--local_rank', type=int, default=0)
++    args = parser.parse_args()
++    if 'LOCAL_RANK' not in os.environ:
++        os.environ['LOCAL_RANK'] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            '--options and --eval-options cannot be both specified, '
++            '--options is deprecated in favor of --eval-options')
++    if args.options:
++        warnings.warn('--options is deprecated in favor of --eval-options')
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++
++    # assert args.out or args.eval or args.format_only or args.show \
++    #     or args.show_dir, \
++    #     ('Please specify at least one operation (save/eval/format/show the '
++    #      'results / save the results) with the argument "--out", "--eval"'
++    #      ', "--format-only", "--show" or "--show-dir"')
++
++    if args.eval and args.format_only:
++        raise ValueError('--eval and --format_only cannot be both specified')
++
++    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
++        raise ValueError('The output file must be a pkl file.')
++
++    cfg = Config.fromfile(args.config)
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # import modules from string list.
++    if cfg.get('custom_imports', None):
++        from mmcv.utils import import_modules_from_strings
++        import_modules_from_strings(**cfg['custom_imports'])
++    
++    # import modules from plguin/xx, registry will be updated
++    if hasattr(cfg, 'plugin'):
++        if cfg.plugin:
++            import importlib
++            if hasattr(cfg, 'plugin_dir'):
++                plugin_dir = cfg.plugin_dir
++                _module_dir = os.path.dirname(plugin_dir)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++            else:
++                # import dir is the dirpath for the config file
++                _module_dir = os.path.dirname(args.config)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++
++    # set cudnn_benchmark
++    if cfg.get('cudnn_benchmark', False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(
++                cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop('samples_per_gpu', 1) for ds_cfg in cfg.data.test])
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    if args.launcher == 'none':
++        distributed = False
++    else:
++        distributed = True
++        init_dist(args.launcher, **cfg.dist_params)
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False)
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'), train_cfg=cfg.get('train_cfg'))
++    fp16_cfg = cfg.get('fp16', None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if 'CLASSES' in checkpoint.get('meta', {}):
++        model.CLASSES = checkpoint['meta']['CLASSES']
++    else:
++        model.CLASSES = dataset.CLASSES
++    # palette for visualization in segmentation tasks
++    if 'PALETTE' in checkpoint.get('meta', {}):
++        model.PALETTE = checkpoint['meta']['PALETTE']
++    elif hasattr(dataset, 'PALETTE'):
++        # segmentation dataset has `PALETTE` attribute
++        model.PALETTE = dataset.PALETTE
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.area_rate_str,
++                                  args.optim_lr,
++                                  args.optim_step,
++                                  args.index_min,
++                                  args.index_max,
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False)
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
++                                 args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f'\nwriting results to {args.out}')
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get('evaluation', {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
++                    'rule'
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/test_pgd_img_launcher.py b/tools/test_pgd_img_launcher.py
+new file mode 100755
+index 0000000..42d1f91
+--- /dev/null
++++ b/tools/test_pgd_img_launcher.py
+@@ -0,0 +1,256 @@
++# Copyright (c) OpenMMLab. All rights reserved.
++import argparse
++import mmcv
++import os
++import sys
++sys_path = os.path.abspath(".")
++sys.path.append(sys_path)
++import torch
++import warnings
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
++                         wrap_fp16_model)
++
++from projects.mmdet3d_plugin.apis_common.test_pgd_img import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description='MMDet test (and eval) a model')
++    parser.add_argument('config', help='test config file path')
++    parser.add_argument('checkpoint', help='checkpoint file')
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('eps255', help='eps of pgd in 0-255')
++    parser.add_argument('step', help='step of pgd')
++    parser.add_argument('--out', help='output result file in pickle format')
++    parser.add_argument(
++        '--fuse-conv-bn',
++        action='store_true',
++        help='Whether to fuse conv and bn, this will slightly increase'
++        'the inference speed')
++    parser.add_argument(
++        '--format-only',
++        action='store_true',
++        help='Format the output results without perform evaluation. It is'
++        'useful when you want to format the result to a specific format and '
++        'submit it to the test server')
++    parser.add_argument(
++        '--eval',
++        type=str,
++        nargs='+',
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
++    parser.add_argument('--show', action='store_true', help='show results')
++    parser.add_argument(
++        '--show-dir', help='directory where results will be saved')
++    parser.add_argument(
++        '--gpu-collect',
++        action='store_true',
++        help='whether to use gpu to collect results.')
++    parser.add_argument(
++        '--tmpdir',
++        help='tmp directory used for collecting results from multiple '
++        'workers, available when gpu-collect is not specified')
++    parser.add_argument('--seed', type=int, default=0, help='random seed')
++    parser.add_argument(
++        '--deterministic',
++        action='store_true',
++        help='whether to set deterministic options for CUDNN backend.')
++    parser.add_argument(
++        '--cfg-options',
++        nargs='+',
++        action=DictAction,
++        help='override some settings in the used config, the key-value pair '
++        'in xxx=yyy format will be merged into config file. If the value to '
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        'Note that the quotation marks are necessary and that no white space '
++        'is allowed.')
++    parser.add_argument(
++        '--options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function (deprecate), '
++        'change to --eval-options instead.')
++    parser.add_argument(
++        '--eval-options',
++        nargs='+',
++        action=DictAction,
++        help='custom options for evaluation, the key-value pair in xxx=yyy '
++        'format will be kwargs for dataset.evaluate() function')
++    parser.add_argument(
++        '--launcher',
++        choices=['none', 'pytorch', 'slurm', 'mpi'],
++        default='none',
++        help='job launcher')
++    parser.add_argument('--local_rank', type=int, default=0)
++    args = parser.parse_args()
++    if 'LOCAL_RANK' not in os.environ:
++        os.environ['LOCAL_RANK'] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            '--options and --eval-options cannot be both specified, '
++            '--options is deprecated in favor of --eval-options')
++    if args.options:
++        warnings.warn('--options is deprecated in favor of --eval-options')
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++
++    # assert args.out or args.eval or args.format_only or args.show \
++    #     or args.show_dir, \
++    #     ('Please specify at least one operation (save/eval/format/show the '
++    #      'results / save the results) with the argument "--out", "--eval"'
++    #      ', "--format-only", "--show" or "--show-dir"')
++
++    if args.eval and args.format_only:
++        raise ValueError('--eval and --format_only cannot be both specified')
++
++    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
++        raise ValueError('The output file must be a pkl file.')
++
++    cfg = Config.fromfile(args.config)
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # import modules from string list.
++    if cfg.get('custom_imports', None):
++        from mmcv.utils import import_modules_from_strings
++        import_modules_from_strings(**cfg['custom_imports'])
++    
++    # import modules from plguin/xx, registry will be updated
++    if hasattr(cfg, 'plugin'):
++        if cfg.plugin:
++            import importlib
++            if hasattr(cfg, 'plugin_dir'):
++                plugin_dir = cfg.plugin_dir
++                _module_dir = os.path.dirname(plugin_dir)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++            else:
++                # import dir is the dirpath for the config file
++                _module_dir = os.path.dirname(args.config)
++                _module_dir = _module_dir.split('/')
++                _module_path = _module_dir[0]
++                for m in _module_dir[1:]:
++                    _module_path = _module_path + '.' + m
++                print(_module_path)
++                plg_lib = importlib.import_module(_module_path)
++
++    # set cudnn_benchmark
++    if cfg.get('cudnn_benchmark', False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(
++                cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop('samples_per_gpu', 1) for ds_cfg in cfg.data.test])
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    if args.launcher == 'none':
++        distributed = False
++    else:
++        distributed = True
++        init_dist(args.launcher, **cfg.dist_params)
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False)
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'), train_cfg=cfg.get('train_cfg'))
++    fp16_cfg = cfg.get('fp16', None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if 'CLASSES' in checkpoint.get('meta', {}):
++        model.CLASSES = checkpoint['meta']['CLASSES']
++    else:
++        model.CLASSES = dataset.CLASSES
++    # palette for visualization in segmentation tasks
++    if 'PALETTE' in checkpoint.get('meta', {}):
++        model.PALETTE = checkpoint['meta']['PALETTE']
++    elif hasattr(dataset, 'PALETTE'):
++        # segmentation dataset has `PALETTE` attribute
++        model.PALETTE = dataset.PALETTE
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.eps255,
++                                  args.step
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False)
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
++                                 args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f'\nwriting results to {args.out}')
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get('evaluation', {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
++                    'rule'
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == '__main__':
++    main()

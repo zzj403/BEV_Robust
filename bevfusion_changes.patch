@@ -1,0 +1,4031 @@
+diff --git a/.gitignore b/.gitignore
+index b6e4761..fe21cf8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,6 +5,11 @@ __pycache__/
+ 
+ # C extensions
+ *.so
++data/
++
++*.pkl
++*.pth
++.vscode/
+ 
+ # Distribution / packaging
+ .Python
+diff --git a/extend/__init__.py b/extend/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/extend/custom_func.py b/extend/custom_func.py
+new file mode 100644
+index 0000000..94e5057
+--- /dev/null
++++ b/extend/custom_func.py
+@@ -0,0 +1,102 @@
++# only for bevfusion
++import torch
++import torchvision.transforms as transforms
++import torch.nn.functional as F
++import torchvision
++from torchvision.utils import save_image
++import copy
++
++
++def custom_data_preprocess(data):
++    return data
++
++
++def custom_data_postprocess_eval(data):
++    return data
++
++
++def custom_data_work(data):
++    metas = data["metas"]._data[0][0]
++    img_path_list = metas["filename"]
++    img_org_np = metas["img_org"]
++    img_processed = data["img"]._data[0].clone()
++    gt_labels_3d = data["gt_labels_3d"]._data[0][0]
++    return metas, img_path_list, img_org_np, img_processed, gt_labels_3d
++
++
++def custom_data_work_point(data):
++    metas = data["metas"]._data[0][0]
++    img_path_list = metas["filename"]
++    img_org_np = metas["img_org"]
++    img_processed = data["img"]._data[0].clone()
++    gt_labels_3d = data["gt_labels_3d"]._data[0][0]
++    points_tensor = data["points"]._data[0][0].clone()
++    return metas, img_path_list, img_org_np, img_processed, gt_labels_3d, points_tensor
++
++
++def custom_result_postprocess(result):
++    return result
++
++
++def custom_img_read_from_img_org(img_org_np, device):
++    img_org_np_255_rgb_hwcn_uint8 = img_org_np  # PIL读取 RGB 直接转 numpy
++    img_org_tensor_rgb_255_hwcn = torch.from_numpy(
++        img_org_np_255_rgb_hwcn_uint8
++    ).float()
++    img_org_tensor_rgb_255 = img_org_tensor_rgb_255_hwcn.permute(3, 2, 0, 1)
++    img_tensor_rgb_6chw_0to1 = (img_org_tensor_rgb_255 / 255.0).to(device)
++    return img_tensor_rgb_6chw_0to1
++
++
++def custom_differentiable_transform(img_tensor_rgb_6chw_0to1, img_metas):
++    """Alternative Data Preparation for Original Model
++
++    Args:
++        img_tensor (torch.tensor): (6xCxHxW), tensors of original imgs
++    """
++
++    assert len(img_tensor_rgb_6chw_0to1.shape) == 4
++    assert img_tensor_rgb_6chw_0to1.shape[0] == 6
++    assert img_tensor_rgb_6chw_0to1.shape[1] == 3
++    assert img_tensor_rgb_6chw_0to1.max() <= 1.0
++    assert img_tensor_rgb_6chw_0to1.min() >= 0.0
++    assert img_tensor_rgb_6chw_0to1.dtype == torch.float32
++    assert img_tensor_rgb_6chw_0to1.is_cuda
++    img_tensor = img_tensor_rgb_6chw_0to1
++
++    device = img_tensor_rgb_6chw_0to1.device
++    mean = [0.485, 0.456, 0.406]
++    std = [0.229, 0.224, 0.225]
++    mean = torch.tensor(mean).to(device)[None, None, :, None, None]
++    std = torch.tensor(std).to(device)[None, None, :, None, None]
++
++    ############ resize norm pad
++    ######## resize
++    resize_size = (432, 768)
++    img_tensor_resize = F.interpolate(
++        img_tensor, resize_size, mode="bilinear", align_corners=False
++    )
++
++    ######## crop
++    crop_size = (32, 176, 736, 432)
++    img_tensor_crop = img_tensor_resize[
++        ..., crop_size[1] : crop_size[3], crop_size[0] : crop_size[2]
++    ]
++
++    ######## norm
++    img_tensor_norm = (img_tensor_crop - mean) / std
++
++    return img_tensor_norm
++
++
++def custom_image_data_give(data, image_ready):
++    data_copy = copy.deepcopy(data)
++    data_copy["img"]._data[0] = image_ready
++    return data_copy
++
++
++def custom_image_data_give_point(data, image_ready, points_ready):
++    data_copy = copy.deepcopy(data)
++    data_copy["img"]._data[0] = image_ready
++    data_copy["points"]._data[0][0] = points_ready
++    return data_copy
+diff --git a/extend_common b/extend_common
+new file mode 120000
+index 0000000..0633dd9
+--- /dev/null
++++ b/extend_common
+@@ -0,0 +1 @@
++../extend_common/
+\ No newline at end of file
+diff --git a/mmdet3d/apis_common b/mmdet3d/apis_common
+new file mode 120000
+index 0000000..b44e193
+--- /dev/null
++++ b/mmdet3d/apis_common
+@@ -0,0 +1 @@
++../../apis_common/
+\ No newline at end of file
+diff --git a/mmdet3d/datasets/pipelines/formating.py b/mmdet3d/datasets/pipelines/formating.py
+index 3e781ce..34ac202 100644
+--- a/mmdet3d/datasets/pipelines/formating.py
++++ b/mmdet3d/datasets/pipelines/formating.py
+@@ -157,6 +157,8 @@ class Collect3D:
+             "pcd_rotation",
+             "lidar_path",
+             "transformation_3d_flow",
++            # zzj api
++            'img_org'
+         ),
+     ):
+         self.keys = keys
+diff --git a/mmdet3d/datasets/pipelines/loading.py b/mmdet3d/datasets/pipelines/loading.py
+index cac5b6d..8b57313 100644
+--- a/mmdet3d/datasets/pipelines/loading.py
++++ b/mmdet3d/datasets/pipelines/loading.py
+@@ -70,6 +70,9 @@ class LoadMultiViewImageFromFiles:
+         results["pad_shape"] = images[0].size
+         results["scale_factor"] = 1.0
+         
++        # zzj add
++        results["img_org"] = np.stack([np.asarray(image) for image in images],axis=-1)
++        
+         return results
+ 
+     def __repr__(self):
+diff --git a/mmdet3d/models/fusion_models/bevfusion.py b/mmdet3d/models/fusion_models/bevfusion.py
+index 2931b48..301f5dd 100644
+--- a/mmdet3d/models/fusion_models/bevfusion.py
++++ b/mmdet3d/models/fusion_models/bevfusion.py
+@@ -126,13 +126,20 @@ class BEVFusion(Base3DFusionModel):
+         )
+         return x
+ 
++    # def extract_lidar_features(self, x) -> torch.Tensor:
++    #     feats, coords, sizes = self.voxelize(x)
++    #     batch_size = coords[-1, 0] + 1
++    #     x = self.encoders["lidar"]["backbone"](feats, coords, batch_size, sizes=sizes)
++    #     return x
+     def extract_lidar_features(self, x) -> torch.Tensor:
+         feats, coords, sizes = self.voxelize(x)
++        # zzj api voxelization
++        coords = coords[:,[0,3,2,1]]   # z,y,x -->> x,y,z plz check mmcvfull1.6.1: mmcv\ops\csrc\common\cuda\voxelization_cuda_kernel.cuh L-45
+         batch_size = coords[-1, 0] + 1
+-        x = self.encoders["lidar"]["backbone"](feats, coords, batch_size, sizes=sizes)
++        x = self.encoders["lidar"]["backbone"](feats, coords, batch_size, sizes=sizes) # SparseEncoder        
+         return x
+ 
+-    @torch.no_grad()
++    # @torch.no_grad()
+     @force_fp32()
+     def voxelize(self, points):
+         feats, coords, sizes = [], [], []
+@@ -261,7 +268,8 @@ class BEVFusion(Base3DFusionModel):
+         x = self.decoder["backbone"](x)
+         x = self.decoder["neck"](x)
+ 
+-        if self.training:
++        # if self.training:
++        if kwargs['return_loss']:
+             outputs = {}
+             for type, head in self.heads.items():
+                 if type == "object":
+diff --git a/mmdet3d/models/vtransforms/base.py b/mmdet3d/models/vtransforms/base.py
+index 400054c..2094e18 100644
+--- a/mmdet3d/models/vtransforms/base.py
++++ b/mmdet3d/models/vtransforms/base.py
+@@ -240,7 +240,7 @@ class BaseDepthTransform(BaseTransform):
+         )
+ 
+         for b in range(batch_size):
+-            cur_coords = points[b][:, :3]
++            cur_coords = points[b][:, :3].detach()
+             cur_img_aug_matrix = img_aug_matrix[b]
+             cur_lidar_aug_matrix = lidar_aug_matrix[b]
+             cur_lidar2image = lidar2image[b]
+@@ -272,7 +272,7 @@ class BaseDepthTransform(BaseTransform):
+                 & (cur_coords[..., 1] < self.image_size[1])
+                 & (cur_coords[..., 1] >= 0)
+             )
+-            for c in range(on_img.shape[0]):
++            for c in range(on_img.shape[0]): # 把 有lidar的点 在depth 上 打出来，数值为真实深度（m）
+                 masked_coords = cur_coords[c, on_img[c]].long()
+                 masked_dist = dist[c, on_img[c]]
+                 depth[b, c, 0, masked_coords[:, 0], masked_coords[:, 1]] = masked_dist
+diff --git a/mmdet3d/models/vtransforms/depth_lss.py b/mmdet3d/models/vtransforms/depth_lss.py
+index b7cd45d..263aa4a 100644
+--- a/mmdet3d/models/vtransforms/depth_lss.py
++++ b/mmdet3d/models/vtransforms/depth_lss.py
+@@ -82,11 +82,11 @@ class DepthLSSTransform(BaseDepthTransform):
+     def get_cam_feats(self, x, d):
+         B, N, C, fH, fW = x.shape
+ 
+-        d = d.view(B * N, *d.shape[2:])
++        d = d.view(B * N, *d.shape[2:]) # 这里的d 可是从LiDAR 投影过来的，是GT啊！
+         x = x.view(B * N, C, fH, fW)
+ 
+-        d = self.dtransform(d)
+-        x = torch.cat([d, x], dim=1)
++        d = self.dtransform(d) # 但gt的 d 还是被投入 模型运算 了
++        x = torch.cat([d, x], dim=1) # 处理后的d 作为特征的一部分，供深度预测了
+         x = self.depthnet(x)
+ 
+         depth = x[:, : self.D].softmax(dim=1)
+diff --git a/mmdet3d/ops/voxel/src/voxelization.h b/mmdet3d/ops/voxel/src/voxelization.h
+index 765b30a..1e96c4e 100644
+--- a/mmdet3d/ops/voxel/src/voxelization.h
++++ b/mmdet3d/ops/voxel/src/voxelization.h
+@@ -27,6 +27,11 @@ int hard_voxelize_gpu(const at::Tensor &points, at::Tensor &voxels,
+                       const std::vector<float> voxel_size,
+                       const std::vector<float> coors_range,
+                       const int max_points, const int max_voxels,
++                      // zzj api 20220224
++                      // : add input valuables for return
++                      at::Tensor &point_to_pointidx,
++                      at::Tensor &point_to_voxelidx,
++                      at::Tensor &coor_to_voxelidx,
+                       const int NDim = 3);
+ 
+ int nondisterministic_hard_voxelize_gpu(const at::Tensor &points, at::Tensor &voxels,
+@@ -60,12 +65,22 @@ inline int hard_voxelize(const at::Tensor &points, at::Tensor &voxels,
+                          const std::vector<float> voxel_size,
+                          const std::vector<float> coors_range,
+                          const int max_points, const int max_voxels,
++                         // zzj api 20220224
++                         // : add input valuables for return
++                         at::Tensor &point_to_pointidx,
++                         at::Tensor &point_to_voxelidx,
++                         at::Tensor &coor_to_voxelidx,
+                          const int NDim = 3, const bool deterministic = true) {
+   if (points.device().is_cuda()) {
+ #ifdef WITH_CUDA
+     if (deterministic) {
+       return hard_voxelize_gpu(points, voxels, coors, num_points_per_voxel,
+                                voxel_size, coors_range, max_points, max_voxels,
++                               // zzj api 20220224
++                               // : add input valuables for return
++                               point_to_pointidx,
++                               point_to_voxelidx,
++                               coor_to_voxelidx,
+                                NDim);
+     }
+     return nondisterministic_hard_voxelize_gpu(points, voxels, coors, num_points_per_voxel,
+diff --git a/mmdet3d/ops/voxel/src/voxelization_cpu.cpp b/mmdet3d/ops/voxel/src/voxelization_cpu.cpp
+index 1f87e26..6bcec40 100644
+--- a/mmdet3d/ops/voxel/src/voxelization_cpu.cpp
++++ b/mmdet3d/ops/voxel/src/voxelization_cpu.cpp
+@@ -27,7 +27,7 @@ void dynamic_voxelize_kernel(const torch::TensorAccessor<T, 2> points,
+         failed = true;
+         break;
+       }
+-      coor[j] = c;
++      coor[ndim_minus_1 - j] = c;
+     }
+ 
+     for (int k = 0; k < NDim; ++k) {
+diff --git a/mmdet3d/ops/voxel/src/voxelization_cuda.cu b/mmdet3d/ops/voxel/src/voxelization_cuda.cu
+index 8191cba..b3b4af5 100644
+--- a/mmdet3d/ops/voxel/src/voxelization_cuda.cu
++++ b/mmdet3d/ops/voxel/src/voxelization_cuda.cu
+@@ -53,9 +53,9 @@ __global__ void dynamic_voxelize_kernel(
+       coors_offset[1] = -1;
+       coors_offset[2] = -1;
+     } else {
+-      coors_offset[0] = c_x;
++      coors_offset[0] = c_z;
+       coors_offset[1] = c_y;
+-      coors_offset[2] = c_z;
++      coors_offset[2] = c_x;
+     }
+   }
+ }
+@@ -166,10 +166,10 @@ __global__ void determin_voxel_num(
+       int voxelidx = voxel_num[0];
+       if (voxel_num[0] >= max_voxels) continue;
+       voxel_num[0] += 1;
+-      coor_to_voxelidx[i] = voxelidx;
++      coor_to_voxelidx[i] = voxelidx;  // coor_to_voxelidx 应该改名为 point_to_voxelidx
+       num_points_per_voxel[voxelidx] = 1;
+     } else {
+-      int point_idx = point_to_pointidx[i];
++      int point_idx = point_to_pointidx[i];  // 从当前点，跳到体素的第一个点，再用第一个点查询体素的index
+       int voxelidx = coor_to_voxelidx[point_idx];
+       if (voxelidx != -1) {
+         coor_to_voxelidx[i] = voxelidx;
+@@ -233,6 +233,11 @@ int hard_voxelize_gpu(const at::Tensor& points, at::Tensor& voxels,
+                       const std::vector<float> voxel_size,
+                       const std::vector<float> coors_range,
+                       const int max_points, const int max_voxels,
++                      // zzj api 20220224
++                      // : add for return
++                      at::Tensor &point_to_pointidx,
++                      at::Tensor &point_to_voxelidx,
++                      at::Tensor &coor_to_voxelidx,
+                       const int NDim = 3) {
+   // current version tooks about 0.04s for one frame on cpu
+   // check device
+@@ -280,16 +285,20 @@ int hard_voxelize_gpu(const at::Tensor& points, at::Tensor& voxels,
+ 
+   // 2. map point to the idx of the corresponding voxel, find duplicate coor
+   // create some temporary variables
+-  auto point_to_pointidx = -at::ones(
+-      {
+-          num_points,
+-      },
+-      points.options().dtype(at::kInt));
+-  auto point_to_voxelidx = -at::ones(
+-      {
+-          num_points,
+-      },
+-      points.options().dtype(at::kInt));
++
++  // zzj api 20220224
++  // : use outside coming values defined in python 
++  // not defined in C 
++  // auto point_to_pointidx = -at::ones(
++  //     {
++  //         num_points,
++  //     },
++  //     points.options().dtype(at::kInt));
++  // auto point_to_voxelidx = -at::ones(
++  //     {
++  //         num_points,
++  //     },
++  //     points.options().dtype(at::kInt));
+ 
+   dim3 map_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
+   dim3 map_block(512);
+@@ -307,11 +316,16 @@ int hard_voxelize_gpu(const at::Tensor& points, at::Tensor& voxels,
+ 
+   // 3. determin voxel num and voxel's coor index
+   // make the logic in the CUDA device could accelerate about 10 times
+-  auto coor_to_voxelidx = -at::ones(
+-      {
+-          num_points,
+-      },
+-      points.options().dtype(at::kInt));
++  
++  // zzj api 20220224
++  // : use outside coming values defined in python 
++  // not defined in C 
++  // auto coor_to_voxelidx = -at::ones(
++  //     {
++  //         num_points,
++  //     },
++  //     points.options().dtype(at::kInt));
++
+   auto voxel_num = at::zeros(
+       {
+           1,
+diff --git a/mmdet3d/ops/voxel/src_backup/scatter_points_cpu.cpp b/mmdet3d/ops/voxel/src_backup/scatter_points_cpu.cpp
+new file mode 100644
+index 0000000..c22b8ae
+--- /dev/null
++++ b/mmdet3d/ops/voxel/src_backup/scatter_points_cpu.cpp
+@@ -0,0 +1,122 @@
++#include <ATen/TensorUtils.h>
++#include <torch/extension.h>
++// #include "voxelization.h"
++
++namespace {
++
++template <typename T_int>
++void determin_max_points_kernel(
++    torch::TensorAccessor<T_int, 2> coor,
++    torch::TensorAccessor<T_int, 1> point_to_voxelidx,
++    torch::TensorAccessor<T_int, 1> num_points_per_voxel,
++    torch::TensorAccessor<T_int, 3> coor_to_voxelidx, int& voxel_num,
++    int& max_points, const int num_points) {
++  int voxelidx, num;
++  for (int i = 0; i < num_points; ++i) {
++    if (coor[i][0] == -1) continue;
++    voxelidx = coor_to_voxelidx[coor[i][0]][coor[i][1]][coor[i][2]];
++
++    // record voxel
++    if (voxelidx == -1) {
++      voxelidx = voxel_num;
++      voxel_num += 1;
++      coor_to_voxelidx[coor[i][0]][coor[i][1]][coor[i][2]] = voxelidx;
++    }
++
++    // put points into voxel
++    num = num_points_per_voxel[voxelidx];
++    point_to_voxelidx[i] = num;
++    num_points_per_voxel[voxelidx] += 1;
++
++    // update max points per voxel
++    max_points = std::max(max_points, num + 1);
++  }
++
++  return;
++}
++
++template <typename T, typename T_int>
++void scatter_point_to_voxel_kernel(
++    const torch::TensorAccessor<T, 2> points,
++    torch::TensorAccessor<T_int, 2> coor,
++    torch::TensorAccessor<T_int, 1> point_to_voxelidx,
++    torch::TensorAccessor<T_int, 3> coor_to_voxelidx,
++    torch::TensorAccessor<T, 3> voxels,
++    torch::TensorAccessor<T_int, 2> voxel_coors, const int num_features,
++    const int num_points, const int NDim) {
++  for (int i = 0; i < num_points; ++i) {
++    int num = point_to_voxelidx[i];
++    int voxelidx = coor_to_voxelidx[coor[i][0]][coor[i][1]][coor[i][2]];
++    for (int k = 0; k < num_features; ++k) {
++      voxels[voxelidx][num][k] = points[i][k];
++    }
++    for (int k = 0; k < NDim; ++k) {
++      voxel_coors[voxelidx][k] = coor[i][k];
++    }
++  }
++}
++
++}  // namespace
++
++namespace voxelization {
++
++std::vector<at::Tensor> dynamic_point_to_voxel_cpu(
++    const at::Tensor& points, const at::Tensor& voxel_mapping,
++    const std::vector<float> voxel_size, const std::vector<float> coors_range) {
++  // current version tooks about 0.02s_0.03s for one frame on cpu
++  // check device
++  AT_ASSERTM(points.device().is_cpu(), "points must be a CPU tensor");
++
++  const int NDim = voxel_mapping.size(1);
++  const int num_points = points.size(0);
++  const int num_features = points.size(1);
++
++  std::vector<int> grid_size(NDim);
++  for (int i = 0; i < NDim; ++i) {
++    grid_size[i] =
++        round((coors_range[NDim + i] - coors_range[i]) / voxel_size[i]);
++  }
++
++  at::Tensor num_points_per_voxel = at::zeros(
++      {
++          num_points,
++      },
++      voxel_mapping.options());
++  at::Tensor coor_to_voxelidx = -at::ones(
++      {grid_size[2], grid_size[1], grid_size[0]}, voxel_mapping.options());
++  at::Tensor point_to_voxelidx = -at::ones(
++      {
++          num_points,
++      },
++      voxel_mapping.options());
++
++  int voxel_num = 0;
++  int max_points = 0;
++  AT_DISPATCH_ALL_TYPES(voxel_mapping.scalar_type(), "determin_max_point", [&] {
++    determin_max_points_kernel<scalar_t>(
++        voxel_mapping.accessor<scalar_t, 2>(),
++        point_to_voxelidx.accessor<scalar_t, 1>(),
++        num_points_per_voxel.accessor<scalar_t, 1>(),
++        coor_to_voxelidx.accessor<scalar_t, 3>(), voxel_num, max_points,
++        num_points);
++  });
++
++  at::Tensor voxels =
++      at::zeros({voxel_num, max_points, num_features}, points.options());
++  at::Tensor voxel_coors =
++      at::zeros({voxel_num, NDim}, points.options().dtype(at::kInt));
++
++  AT_DISPATCH_ALL_TYPES(points.scalar_type(), "scatter_point_to_voxel", [&] {
++    scatter_point_to_voxel_kernel<scalar_t, int>(
++        points.accessor<scalar_t, 2>(), voxel_mapping.accessor<int, 2>(),
++        point_to_voxelidx.accessor<int, 1>(),
++        coor_to_voxelidx.accessor<int, 3>(), voxels.accessor<scalar_t, 3>(),
++        voxel_coors.accessor<int, 2>(), num_features, num_points, NDim);
++  });
++
++  at::Tensor num_points_per_voxel_out =
++      num_points_per_voxel.slice(/*dim=*/0, /*start=*/0, /*end=*/voxel_num);
++  return {voxels, voxel_coors, num_points_per_voxel_out};
++}
++
++}  // namespace voxelization
+diff --git a/mmdet3d/ops/voxel/src_backup/scatter_points_cuda.cu b/mmdet3d/ops/voxel/src_backup/scatter_points_cuda.cu
+new file mode 100644
+index 0000000..2ed1869
+--- /dev/null
++++ b/mmdet3d/ops/voxel/src_backup/scatter_points_cuda.cu
+@@ -0,0 +1,310 @@
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <torch/types.h>
++
++#include <ATen/cuda/CUDAApplyUtils.cuh>
++
++typedef enum { SUM = 0, MEAN = 1, MAX = 2 } reduce_t;
++
++#define CHECK_CUDA(x) \
++  TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
++#define CHECK_CONTIGUOUS(x) \
++  TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
++#define CHECK_INPUT(x) \
++  CHECK_CUDA(x);       \
++  CHECK_CONTIGUOUS(x)
++
++namespace {
++int const threadsPerBlock = 512;
++int const maxGridDim = 50000;
++}  // namespace
++
++__device__ __forceinline__ static void reduceMax(float *address, float val) {
++  int *address_as_i = reinterpret_cast<int *>(address);
++  int old = *address_as_i, assumed;
++  do {
++    assumed = old;
++    old = atomicCAS(address_as_i, assumed,
++                    __float_as_int(fmaxf(val, __int_as_float(assumed))));
++  } while (assumed != old || __int_as_float(old) < val);
++}
++
++__device__ __forceinline__ static void reduceMax(double *address, double val) {
++  unsigned long long *address_as_ull =
++      reinterpret_cast<unsigned long long *>(address);
++  unsigned long long old = *address_as_ull, assumed;
++  do {
++    assumed = old;
++    old = atomicCAS(
++        address_as_ull, assumed,
++        __double_as_longlong(fmax(val, __longlong_as_double(assumed))));
++  } while (assumed != old || __longlong_as_double(old) < val);
++}
++
++// get rid of meaningless warnings when compiling host code
++#ifdef __CUDA_ARCH__
++__device__ __forceinline__ static void reduceAdd(float *address, float val) {
++#if (__CUDA_ARCH__ < 200)
++#warning \
++    "compute capability lower than 2.x. fall back to use CAS version of atomicAdd for float32"
++  int *address_as_i = reinterpret_cast<int *>(address);
++  int old = *address_as_i, assumed;
++  do {
++    assumed = old;
++    old = atomicCAS(address_as_i, assumed,
++                    __float_as_int(val + __int_as_float(assumed)));
++  } while (assumed != old);
++#else
++  atomicAdd(address, val);
++#endif
++}
++
++__device__ __forceinline__ static void reduceAdd(double *address, double val) {
++#if (__CUDA_ARCH__ < 600)
++#warning \
++    "compute capability lower than 6.x. fall back to use CAS version of atomicAdd for float64"
++  unsigned long long *address_as_ull =
++      reinterpret_cast<unsigned long long *>(address);
++  unsigned long long old = *address_as_ull, assumed;
++  do {
++    assumed = old;
++    old = atomicCAS(address_as_ull, assumed,
++                    __double_as_longlong(val + __longlong_as_double(assumed)));
++  } while (assumed != old);
++#else
++  atomicAdd(address, val);
++#endif
++}
++#endif
++
++template <typename T>
++__global__ void
++feats_reduce_kernel(const T *feats, const int32_t *coors_map,
++                    T *reduced_feats, // shall be 0 at initialization
++                    const int num_input, const int num_feats,
++                    const reduce_t reduce_type) {
++  for (int x = blockIdx.x * blockDim.x + threadIdx.x; x < num_input;
++       x += gridDim.x * blockDim.x) {
++    int32_t reduce_to = coors_map[x];
++    if (reduce_to == -1) continue;
++
++    const T *feats_offset = feats + x * num_feats;
++    T *reduced_feats_offset = reduced_feats + reduce_to * num_feats;
++    if (reduce_type == reduce_t::MAX) {
++      for (int i = 0; i < num_feats; i++) {
++        reduceMax(&reduced_feats_offset[i], feats_offset[i]);
++      }
++    } else {
++      for (int i = 0; i < num_feats; i++) {
++        reduceAdd(&reduced_feats_offset[i], feats_offset[i]);
++      }
++    }
++  }
++}
++
++template <typename T>
++__global__ void add_reduce_traceback_grad_kernel(
++    T *grad_feats, const T *grad_reduced_feats, const int32_t *coors_map,
++    const int32_t *reduce_count, const int num_input, const int num_feats,
++    const reduce_t reduce_type) {
++  for (int x = blockIdx.x * blockDim.x + threadIdx.x; x < num_input;
++       x += gridDim.x * blockDim.x) {
++    int32_t reduce_to = coors_map[x];
++    if (reduce_to == -1) {
++      continue;
++    }
++
++    const int input_offset = x * num_feats;
++    T *grad_feats_offset = grad_feats + input_offset;
++    const int reduced_offset = reduce_to * num_feats;
++    const T *grad_reduced_feats_offset = grad_reduced_feats + reduced_offset;
++
++    if (reduce_type == reduce_t::SUM) {
++      for (int i = 0; i < num_feats; i++) {
++        grad_feats_offset[i] = grad_reduced_feats_offset[i];
++      }
++    } else if (reduce_type == reduce_t::MEAN) {
++      for (int i = 0; i < num_feats; i++) {
++        grad_feats_offset[i] = grad_reduced_feats_offset[i] /
++                               static_cast<T>(reduce_count[reduce_to]);
++      }
++    }
++  }
++}
++
++template <typename T>
++__global__ void max_reduce_traceback_scatter_idx_kernel(
++    const T *feats, const T *reduced_feats, int32_t *reduce_from,
++    const int32_t *coors_map, const int num_input, const int num_feats) {
++  for (int x = blockIdx.x * blockDim.x + threadIdx.x; x < num_input;
++       x += gridDim.x * blockDim.x) {
++    int32_t reduce_to = coors_map[x];
++
++    const int input_offset = x * num_feats;
++    const T *feats_offset = feats + input_offset;
++
++    if (reduce_to == -1) {
++      continue;
++    }
++
++    const int reduced_offset = reduce_to * num_feats;
++    const T *reduced_feats_offset = reduced_feats + reduced_offset;
++    int32_t *reduce_from_offset = reduce_from + reduced_offset;
++
++    for (int i = 0; i < num_feats; i++) {
++      if (feats_offset[i] == reduced_feats_offset[i]) {
++        atomicMin(&reduce_from_offset[i], static_cast<int32_t>(x));
++      }
++    }
++  }
++}
++
++template <typename T>
++__global__ void max_reduce_scatter_grad_kernel(T *grad_feats,
++                                               const T *grad_reduced_feats,
++                                               const int32_t *reduce_from,
++                                               const int num_reduced,
++                                               const int num_feats) {
++  for (int x = blockIdx.x * blockDim.x + threadIdx.x; x < num_reduced;
++       x += gridDim.x * blockDim.x) {
++    const int reduced_offset = x * num_feats;
++    const int32_t *scatter_to_offset = reduce_from + reduced_offset;
++    const T *grad_reduced_feats_offset = grad_reduced_feats + reduced_offset;
++
++    for (int i = 0; i < num_feats; i++) {
++      grad_feats[scatter_to_offset[i] * num_feats + i] =
++          grad_reduced_feats_offset[i];
++    }
++  }
++}
++
++namespace voxelization {
++
++std::vector<at::Tensor> dynamic_point_to_voxel_forward_gpu(
++    const at::Tensor &feats, const at::Tensor &coors,
++    const reduce_t reduce_type) {
++  CHECK_INPUT(feats);
++  CHECK_INPUT(coors);
++
++  const int num_input = feats.size(0);
++  const int num_feats = feats.size(1);
++
++  if (num_input == 0)
++    return {feats.clone().detach(),
++            coors.clone().detach(),
++            coors.new_empty({0}, torch::kInt32),
++            coors.new_empty({0}, torch::kInt32)};
++
++  at::Tensor out_coors;
++  at::Tensor coors_map;
++  at::Tensor reduce_count;
++
++  auto coors_clean = coors.masked_fill(coors.lt(0).any(-1, true), -1);
++
++  std::tie(out_coors, coors_map, reduce_count) =
++      at::unique_dim(coors_clean, 0, true, true, true);
++
++  if (out_coors.index({0, 0}).lt(0).item<bool>()) {
++    // the first element of out_coors (-1,-1,-1) and should be removed
++    out_coors = out_coors.slice(0, 1);
++    reduce_count = reduce_count.slice(0, 1);
++    coors_map = coors_map - 1;
++  }
++
++  coors_map = coors_map.to(torch::kInt32);
++  reduce_count = reduce_count.to(torch::kInt32);
++
++  auto reduced_feats =
++      at::empty({out_coors.size(0), num_feats}, feats.options());
++
++  AT_DISPATCH_FLOATING_TYPES(
++      feats.scalar_type(), "feats_reduce_kernel", ([&] {
++    if (reduce_type == reduce_t::MAX)
++      reduced_feats.fill_(-std::numeric_limits<scalar_t>::infinity());
++    else
++      reduced_feats.fill_(static_cast<scalar_t>(0));
++
++    dim3 blocks(std::min(at::cuda::ATenCeilDiv(num_input, threadsPerBlock),
++                         maxGridDim));
++    dim3 threads(threadsPerBlock);
++    feats_reduce_kernel<<<blocks, threads>>>(
++        feats.data_ptr<scalar_t>(), coors_map.data_ptr<int32_t>(),
++        reduced_feats.data_ptr<scalar_t>(), num_input, num_feats, reduce_type);
++    if (reduce_type == reduce_t::MEAN)
++      reduced_feats /= reduce_count.unsqueeze(-1).to(reduced_feats.dtype());
++  }));
++  AT_CUDA_CHECK(cudaGetLastError());
++
++  return {reduced_feats, out_coors, coors_map, reduce_count};
++}
++
++void dynamic_point_to_voxel_backward_gpu(at::Tensor &grad_feats,
++                                         const at::Tensor &grad_reduced_feats,
++                                         const at::Tensor &feats,
++                                         const at::Tensor &reduced_feats,
++                                         const at::Tensor &coors_map,
++                                         const at::Tensor &reduce_count,
++                                         const reduce_t reduce_type) {
++  CHECK_INPUT(grad_feats);
++  CHECK_INPUT(grad_reduced_feats);
++  CHECK_INPUT(feats);
++  CHECK_INPUT(reduced_feats);
++  CHECK_INPUT(coors_map);
++  CHECK_INPUT(reduce_count);
++
++  const int num_input = feats.size(0);
++  const int num_reduced = reduced_feats.size(0);
++  const int num_feats = feats.size(1);
++
++  grad_feats.fill_(0);
++  // copy voxel grad to points
++
++  if (num_input == 0 || num_reduced == 0) return;
++
++  if (reduce_type == reduce_t::MEAN || reduce_type == reduce_t::SUM) {
++    AT_DISPATCH_FLOATING_TYPES(
++        grad_reduced_feats.scalar_type(), "add_reduce_traceback_grad_kernel",
++        ([&] {
++          dim3 blocks(std::min(
++              at::cuda::ATenCeilDiv(num_input, threadsPerBlock), maxGridDim));
++          dim3 threads(threadsPerBlock);
++          add_reduce_traceback_grad_kernel<<<blocks, threads>>>(
++              grad_feats.data_ptr<scalar_t>(),
++              grad_reduced_feats.data_ptr<scalar_t>(),
++              coors_map.data_ptr<int32_t>(), reduce_count.data_ptr<int32_t>(),
++              num_input, num_feats, reduce_type);
++        }));
++    AT_CUDA_CHECK(cudaGetLastError());
++  } else {
++    auto reduce_from = at::full({num_reduced, num_feats}, num_input,
++                                coors_map.options().dtype(torch::kInt32));
++    AT_DISPATCH_FLOATING_TYPES(
++        grad_reduced_feats.scalar_type(),
++        "max_reduce_traceback_scatter_idx_kernel", ([&] {
++          dim3 blocks(std::min(
++              at::cuda::ATenCeilDiv(num_input, threadsPerBlock), maxGridDim));
++          dim3 threads(threadsPerBlock);
++          max_reduce_traceback_scatter_idx_kernel<<<blocks, threads>>>(
++              feats.data_ptr<scalar_t>(), reduced_feats.data_ptr<scalar_t>(),
++              reduce_from.data_ptr<int32_t>(), coors_map.data_ptr<int32_t>(),
++              num_input, num_feats);
++        }));
++    AT_CUDA_CHECK(cudaGetLastError());
++
++    AT_DISPATCH_FLOATING_TYPES(
++        grad_reduced_feats.scalar_type(),
++        "max_reduce_traceback_scatter_idx_kernel", ([&] {
++          dim3 blocks(std::min(
++              at::cuda::ATenCeilDiv(num_reduced, threadsPerBlock), maxGridDim));
++          dim3 threads(threadsPerBlock);
++          max_reduce_scatter_grad_kernel<<<blocks, threads>>>(
++              grad_feats.data_ptr<scalar_t>(),
++              grad_reduced_feats.data_ptr<scalar_t>(),
++              reduce_from.data_ptr<int32_t>(), num_reduced, num_feats);
++        }));
++    AT_CUDA_CHECK(cudaGetLastError());
++  }
++  return;
++}
++
++}  // namespace voxelization
+diff --git a/mmdet3d/ops/voxel/src_backup/voxelization.cpp b/mmdet3d/ops/voxel/src_backup/voxelization.cpp
+new file mode 100644
+index 0000000..f83348e
+--- /dev/null
++++ b/mmdet3d/ops/voxel/src_backup/voxelization.cpp
+@@ -0,0 +1,13 @@
++#include <torch/extension.h>
++#include "voxelization.h"
++
++namespace voxelization {
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++  m.def("hard_voxelize", &hard_voxelize, "hard voxelize");
++  m.def("dynamic_voxelize", &dynamic_voxelize, "dynamic voxelization");
++  m.def("dynamic_point_to_voxel_forward", &dynamic_point_to_voxel_forward, "dynamic point to voxel forward");
++  m.def("dynamic_point_to_voxel_backward", &dynamic_point_to_voxel_backward, "dynamic point to voxel backward");
++}
++
++} // namespace voxelization
+diff --git a/mmdet3d/ops/voxel/src_backup/voxelization.h b/mmdet3d/ops/voxel/src_backup/voxelization.h
+new file mode 100644
+index 0000000..765b30a
+--- /dev/null
++++ b/mmdet3d/ops/voxel/src_backup/voxelization.h
+@@ -0,0 +1,142 @@
++#pragma once
++#include <torch/extension.h>
++
++typedef enum { SUM = 0, MEAN = 1, MAX = 2 } reduce_t;
++
++namespace voxelization {
++
++int hard_voxelize_cpu(const at::Tensor &points, at::Tensor &voxels,
++                      at::Tensor &coors, at::Tensor &num_points_per_voxel,
++                      const std::vector<float> voxel_size,
++                      const std::vector<float> coors_range,
++                      const int max_points, const int max_voxels,
++                      const int NDim = 3);
++
++void dynamic_voxelize_cpu(const at::Tensor &points, at::Tensor &coors,
++                          const std::vector<float> voxel_size,
++                          const std::vector<float> coors_range,
++                          const int NDim = 3);
++
++std::vector<at::Tensor> dynamic_point_to_voxel_cpu(
++    const at::Tensor &points, const at::Tensor &voxel_mapping,
++    const std::vector<float> voxel_size, const std::vector<float> coors_range);
++
++#ifdef WITH_CUDA
++int hard_voxelize_gpu(const at::Tensor &points, at::Tensor &voxels,
++                      at::Tensor &coors, at::Tensor &num_points_per_voxel,
++                      const std::vector<float> voxel_size,
++                      const std::vector<float> coors_range,
++                      const int max_points, const int max_voxels,
++                      const int NDim = 3);
++
++int nondisterministic_hard_voxelize_gpu(const at::Tensor &points, at::Tensor &voxels,
++                                        at::Tensor &coors, at::Tensor &num_points_per_voxel,
++                                        const std::vector<float> voxel_size,
++                                        const std::vector<float> coors_range,
++                                        const int max_points, const int max_voxels,
++                                        const int NDim = 3);
++
++void dynamic_voxelize_gpu(const at::Tensor &points, at::Tensor &coors,
++                          const std::vector<float> voxel_size,
++                          const std::vector<float> coors_range,
++                          const int NDim = 3);
++
++std::vector<torch::Tensor> dynamic_point_to_voxel_forward_gpu(const torch::Tensor &feats,
++                                                              const torch::Tensor &coors,
++                                                              const reduce_t reduce_type);
++
++void dynamic_point_to_voxel_backward_gpu(torch::Tensor &grad_feats,
++                                         const torch::Tensor &grad_reduced_feats,
++                                         const torch::Tensor &feats,
++                                         const torch::Tensor &reduced_feats,
++                                         const torch::Tensor &coors_idx,
++                                         const torch::Tensor &reduce_count,
++                                         const reduce_t reduce_type);
++#endif
++
++// Interface for Python
++inline int hard_voxelize(const at::Tensor &points, at::Tensor &voxels,
++                         at::Tensor &coors, at::Tensor &num_points_per_voxel,
++                         const std::vector<float> voxel_size,
++                         const std::vector<float> coors_range,
++                         const int max_points, const int max_voxels,
++                         const int NDim = 3, const bool deterministic = true) {
++  if (points.device().is_cuda()) {
++#ifdef WITH_CUDA
++    if (deterministic) {
++      return hard_voxelize_gpu(points, voxels, coors, num_points_per_voxel,
++                               voxel_size, coors_range, max_points, max_voxels,
++                               NDim);
++    }
++    return nondisterministic_hard_voxelize_gpu(points, voxels, coors, num_points_per_voxel,
++                                               voxel_size, coors_range, max_points, max_voxels,
++                                               NDim);
++#else
++    AT_ERROR("Not compiled with GPU support");
++#endif
++  }
++  return hard_voxelize_cpu(points, voxels, coors, num_points_per_voxel,
++                           voxel_size, coors_range, max_points, max_voxels,
++                           NDim);
++}
++
++inline void dynamic_voxelize(const at::Tensor &points, at::Tensor &coors,
++                             const std::vector<float> voxel_size,
++                             const std::vector<float> coors_range,
++                             const int NDim = 3) {
++  if (points.device().is_cuda()) {
++#ifdef WITH_CUDA
++    return dynamic_voxelize_gpu(points, coors, voxel_size, coors_range, NDim);
++#else
++    AT_ERROR("Not compiled with GPU support");
++#endif
++  }
++  return dynamic_voxelize_cpu(points, coors, voxel_size, coors_range, NDim);
++}
++
++inline reduce_t convert_reduce_type(const std::string &reduce_type) {
++  if (reduce_type == "max")
++    return reduce_t::MAX;
++  else if (reduce_type == "sum")
++    return reduce_t::SUM;
++  else if (reduce_type == "mean")
++    return reduce_t::MEAN;
++  else TORCH_CHECK(false, "do not support reduce type " + reduce_type)
++  return reduce_t::SUM;
++}
++
++inline std::vector<torch::Tensor> dynamic_point_to_voxel_forward(const torch::Tensor &feats,
++                                                                 const torch::Tensor &coors,
++                                                                 const std::string &reduce_type) {
++  if (feats.device().is_cuda()) {
++#ifdef WITH_CUDA
++    return dynamic_point_to_voxel_forward_gpu(feats, coors, convert_reduce_type(reduce_type));
++#else
++    TORCH_CHECK(false, "Not compiled with GPU support");
++#endif
++  }
++  TORCH_CHECK(false, "do not support cpu yet");
++  return std::vector<torch::Tensor>();
++}
++
++inline void dynamic_point_to_voxel_backward(torch::Tensor &grad_feats,
++                                            const torch::Tensor &grad_reduced_feats,
++                                            const torch::Tensor &feats,
++                                            const torch::Tensor &reduced_feats,
++                                            const torch::Tensor &coors_idx,
++                                            const torch::Tensor &reduce_count,
++                                            const std::string &reduce_type) {
++  if (grad_feats.device().is_cuda()) {
++#ifdef WITH_CUDA
++    dynamic_point_to_voxel_backward_gpu(
++        grad_feats, grad_reduced_feats, feats, reduced_feats, coors_idx, reduce_count,
++        convert_reduce_type(reduce_type));
++    return;
++#else
++    TORCH_CHECK(false, "Not compiled with GPU support");
++#endif
++  }
++  TORCH_CHECK(false, "do not support cpu yet");
++}
++
++}  // namespace voxelization
+diff --git a/mmdet3d/ops/voxel/src_backup/voxelization_cpu.cpp b/mmdet3d/ops/voxel/src_backup/voxelization_cpu.cpp
+new file mode 100644
+index 0000000..1f87e26
+--- /dev/null
++++ b/mmdet3d/ops/voxel/src_backup/voxelization_cpu.cpp
+@@ -0,0 +1,173 @@
++#include <ATen/TensorUtils.h>
++#include <torch/extension.h>
++// #include "voxelization.h"
++
++namespace {
++
++template <typename T, typename T_int>
++void dynamic_voxelize_kernel(const torch::TensorAccessor<T, 2> points,
++                             torch::TensorAccessor<T_int, 2> coors,
++                             const std::vector<float> voxel_size,
++                             const std::vector<float> coors_range,
++                             const std::vector<int> grid_size,
++                             const int num_points, const int num_features,
++                             const int NDim) {
++  const int ndim_minus_1 = NDim - 1;
++  bool failed = false;
++  // int coor[NDim];
++  int* coor = new int[NDim]();
++  int c;
++
++  for (int i = 0; i < num_points; ++i) {
++    failed = false;
++    for (int j = 0; j < NDim; ++j) {
++      c = floor((points[i][j] - coors_range[j]) / voxel_size[j]);
++      // necessary to rm points out of range
++      if ((c < 0 || c >= grid_size[j])) {
++        failed = true;
++        break;
++      }
++      coor[j] = c;
++    }
++
++    for (int k = 0; k < NDim; ++k) {
++      if (failed)
++        coors[i][k] = -1;
++      else
++        coors[i][k] = coor[k];
++    }
++  }
++
++  delete[] coor;
++  return;
++}
++
++template <typename T, typename T_int>
++void hard_voxelize_kernel(const torch::TensorAccessor<T, 2> points,
++                          torch::TensorAccessor<T, 3> voxels,
++                          torch::TensorAccessor<T_int, 2> coors,
++                          torch::TensorAccessor<T_int, 1> num_points_per_voxel,
++                          torch::TensorAccessor<T_int, 3> coor_to_voxelidx,
++                          int& voxel_num, const std::vector<float> voxel_size,
++                          const std::vector<float> coors_range,
++                          const std::vector<int> grid_size,
++                          const int max_points, const int max_voxels,
++                          const int num_points, const int num_features,
++                          const int NDim) {
++  // declare a temp coors
++  at::Tensor temp_coors = at::zeros(
++      {num_points, NDim}, at::TensorOptions().dtype(at::kInt).device(at::kCPU));
++
++  // First use dynamic voxelization to get coors,
++  // then check max points/voxels constraints
++  dynamic_voxelize_kernel<T, int>(points, temp_coors.accessor<int, 2>(),
++                                  voxel_size, coors_range, grid_size,
++                                  num_points, num_features, NDim);
++
++  int voxelidx, num;
++  auto coor = temp_coors.accessor<int, 2>();
++
++  for (int i = 0; i < num_points; ++i) {
++    // T_int* coor = temp_coors.data_ptr<int>() + i * NDim;
++
++    if (coor[i][0] == -1) continue;
++
++    voxelidx = coor_to_voxelidx[coor[i][0]][coor[i][1]][coor[i][2]];
++
++    // record voxel
++    if (voxelidx == -1) {
++      voxelidx = voxel_num;
++      if (max_voxels != -1 && voxel_num >= max_voxels) continue;
++      voxel_num += 1;
++
++      coor_to_voxelidx[coor[i][0]][coor[i][1]][coor[i][2]] = voxelidx;
++
++      for (int k = 0; k < NDim; ++k) {
++        coors[voxelidx][k] = coor[i][k];
++      }
++    }
++
++    // put points into voxel
++    num = num_points_per_voxel[voxelidx];
++    if (max_points == -1 || num < max_points) {
++      for (int k = 0; k < num_features; ++k) {
++        voxels[voxelidx][num][k] = points[i][k];
++      }
++      num_points_per_voxel[voxelidx] += 1;
++    }
++  }
++
++  return;
++}
++
++}  // namespace
++
++namespace voxelization {
++
++int hard_voxelize_cpu(const at::Tensor& points, at::Tensor& voxels,
++                      at::Tensor& coors, at::Tensor& num_points_per_voxel,
++                      const std::vector<float> voxel_size,
++                      const std::vector<float> coors_range,
++                      const int max_points, const int max_voxels,
++                      const int NDim = 3) {
++  // current version tooks about 0.02s_0.03s for one frame on cpu
++  // check device
++  AT_ASSERTM(points.device().is_cpu(), "points must be a CPU tensor");
++
++  std::vector<int> grid_size(NDim);
++  const int num_points = points.size(0);
++  const int num_features = points.size(1);
++
++  for (int i = 0; i < NDim; ++i) {
++    grid_size[i] =
++        round((coors_range[NDim + i] - coors_range[i]) / voxel_size[i]);
++  }
++
++  // coors, num_points_per_voxel, coor_to_voxelidx are int Tensor
++  // printf("cpu coor_to_voxelidx size: [%d, %d, %d]\n", grid_size[2],
++  // grid_size[1], grid_size[0]);
++  at::Tensor coor_to_voxelidx =
++      -at::ones({grid_size[2], grid_size[1], grid_size[0]}, coors.options());
++
++  int voxel_num = 0;
++  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
++      points.scalar_type(), "hard_voxelize_forward", [&] {
++        hard_voxelize_kernel<scalar_t, int>(
++            points.accessor<scalar_t, 2>(), voxels.accessor<scalar_t, 3>(),
++            coors.accessor<int, 2>(), num_points_per_voxel.accessor<int, 1>(),
++            coor_to_voxelidx.accessor<int, 3>(), voxel_num, voxel_size,
++            coors_range, grid_size, max_points, max_voxels, num_points,
++            num_features, NDim);
++      });
++
++  return voxel_num;
++}
++
++void dynamic_voxelize_cpu(const at::Tensor& points, at::Tensor& coors,
++                          const std::vector<float> voxel_size,
++                          const std::vector<float> coors_range,
++                          const int NDim = 3) {
++  // check device
++  AT_ASSERTM(points.device().is_cpu(), "points must be a CPU tensor");
++
++  std::vector<int> grid_size(NDim);
++  const int num_points = points.size(0);
++  const int num_features = points.size(1);
++
++  for (int i = 0; i < NDim; ++i) {
++    grid_size[i] =
++        round((coors_range[NDim + i] - coors_range[i]) / voxel_size[i]);
++  }
++
++  // coors, num_points_per_voxel, coor_to_voxelidx are int Tensor
++  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
++      points.scalar_type(), "hard_voxelize_forward", [&] {
++        dynamic_voxelize_kernel<scalar_t, int>(
++            points.accessor<scalar_t, 2>(), coors.accessor<int, 2>(),
++            voxel_size, coors_range, grid_size, num_points, num_features, NDim);
++      });
++
++  return;
++}
++
++}  // namespace voxelization
+diff --git a/mmdet3d/ops/voxel/src_backup/voxelization_cuda.cu b/mmdet3d/ops/voxel/src_backup/voxelization_cuda.cu
+new file mode 100644
+index 0000000..f73eed7
+--- /dev/null
++++ b/mmdet3d/ops/voxel/src_backup/voxelization_cuda.cu
+@@ -0,0 +1,534 @@
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <torch/types.h>
++
++#include <ATen/cuda/CUDAApplyUtils.cuh>
++
++#define CHECK_CUDA(x) \
++  TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
++#define CHECK_CONTIGUOUS(x) \
++  TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
++#define CHECK_INPUT(x) \
++  CHECK_CUDA(x);       \
++  CHECK_CONTIGUOUS(x)
++
++namespace {
++int const threadsPerBlock = sizeof(unsigned long long) * 8;
++}
++
++#define CUDA_1D_KERNEL_LOOP(i, n)                            \
++  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
++       i += blockDim.x * gridDim.x)
++
++template <typename T, typename T_int>
++__global__ void dynamic_voxelize_kernel(
++    const T* points, T_int* coors, const float voxel_x, const float voxel_y,
++    const float voxel_z, const float coors_x_min, const float coors_y_min,
++    const float coors_z_min, const float coors_x_max, const float coors_y_max,
++    const float coors_z_max, const int grid_x, const int grid_y,
++    const int grid_z, const int num_points, const int num_features,
++    const int NDim) {
++  //   const int index = blockIdx.x * threadsPerBlock + threadIdx.x;
++  CUDA_1D_KERNEL_LOOP(index, num_points) {
++    // To save some computation
++    auto points_offset = points + index * num_features;
++    auto coors_offset = coors + index * NDim;
++    int c_x = floor((points_offset[0] - coors_x_min) / voxel_x);
++    if (c_x < 0 || c_x >= grid_x) {
++      coors_offset[0] = -1;
++      return;
++    }
++
++    int c_y = floor((points_offset[1] - coors_y_min) / voxel_y);
++    if (c_y < 0 || c_y >= grid_y) {
++      coors_offset[0] = -1;
++      coors_offset[1] = -1;
++      return;
++    }
++
++    int c_z = floor((points_offset[2] - coors_z_min) / voxel_z);
++    if (c_z < 0 || c_z >= grid_z) {
++      coors_offset[0] = -1;
++      coors_offset[1] = -1;
++      coors_offset[2] = -1;
++    } else {
++      // zzj api
++      // coors_offset[0] = c_x;
++      // coors_offset[1] = c_y;
++      // coors_offset[2] = c_z;
++      coors_offset[0] = c_z;
++      coors_offset[1] = c_y;
++      coors_offset[2] = c_x;
++    }
++  }
++}
++
++template <typename T, typename T_int>
++__global__ void assign_point_to_voxel(const int nthreads, const T* points,
++                                      T_int* point_to_voxelidx,
++                                      T_int* coor_to_voxelidx, T* voxels,
++                                      const int max_points,
++                                      const int num_features,
++                                      const int num_points, const int NDim) {
++  CUDA_1D_KERNEL_LOOP(thread_idx, nthreads) {
++    // const int index = blockIdx.x * threadsPerBlock + threadIdx.x;
++    int index = thread_idx / num_features;
++
++    int num = point_to_voxelidx[index];
++    int voxelidx = coor_to_voxelidx[index];
++    if (num > -1 && voxelidx > -1) {
++      auto voxels_offset =
++          voxels + voxelidx * max_points * num_features + num * num_features;
++
++      int k = thread_idx % num_features;
++      voxels_offset[k] = points[thread_idx];
++    }
++  }
++}
++
++template <typename T, typename T_int>
++__global__ void assign_voxel_coors(const int nthreads, T_int* coor,
++                                   T_int* point_to_voxelidx,
++                                   T_int* coor_to_voxelidx, T_int* voxel_coors,
++                                   const int num_points, const int NDim) {
++  CUDA_1D_KERNEL_LOOP(thread_idx, nthreads) {
++    // const int index = blockIdx.x * threadsPerBlock + threadIdx.x;
++    // if (index >= num_points) return;
++    int index = thread_idx / NDim;
++    int num = point_to_voxelidx[index];
++    int voxelidx = coor_to_voxelidx[index];
++    if (num == 0 && voxelidx > -1) {
++      auto coors_offset = voxel_coors + voxelidx * NDim;
++      int k = thread_idx % NDim;
++      coors_offset[k] = coor[thread_idx];
++    }
++  }
++}
++
++template <typename T_int>
++__global__ void point_to_voxelidx_kernel(const T_int* coor,
++                                         T_int* point_to_voxelidx,
++                                         T_int* point_to_pointidx,
++                                         const int max_points,
++                                         const int max_voxels,
++                                         const int num_points, const int NDim) {
++  CUDA_1D_KERNEL_LOOP(index, num_points) {
++    auto coor_offset = coor + index * NDim;
++    // skip invalid points
++    if ((index >= num_points) || (coor_offset[0] == -1)) return;
++
++    int num = 0;
++    int coor_x = coor_offset[0];
++    int coor_y = coor_offset[1];
++    int coor_z = coor_offset[2];
++    // only calculate the coors before this coor[index]
++    for (int i = 0; i < index; ++i) {
++      auto prev_coor = coor + i * NDim;
++      if (prev_coor[0] == -1) continue;
++
++      // Find all previous points that have the same coors
++      // if find the same coor, record it
++      if ((prev_coor[0] == coor_x) && (prev_coor[1] == coor_y) &&
++          (prev_coor[2] == coor_z)) {
++        num++;
++        if (num == 1) {
++          // point to the same coor that first show up
++          point_to_pointidx[index] = i;
++        } else if (num >= max_points) {
++          // out of boundary
++          return;
++        }
++      }
++    }
++    if (num == 0) {
++      point_to_pointidx[index] = index;
++    }
++    if (num < max_points) {
++      point_to_voxelidx[index] = num;
++    }
++  }
++}
++
++template <typename T_int>
++__global__ void determin_voxel_num(
++    // const T_int* coor,
++    T_int* num_points_per_voxel, T_int* point_to_voxelidx,
++    T_int* point_to_pointidx, T_int* coor_to_voxelidx, T_int* voxel_num,
++    const int max_points, const int max_voxels, const int num_points) {
++  // only calculate the coors before this coor[index]
++  for (int i = 0; i < num_points; ++i) {
++    // if (coor[i][0] == -1)
++    //    continue;
++    int point_pos_in_voxel = point_to_voxelidx[i];
++    // record voxel
++    if (point_pos_in_voxel == -1) {
++      // out of max_points or invalid point
++      continue;
++    } else if (point_pos_in_voxel == 0) {
++      // record new voxel
++      int voxelidx = voxel_num[0];
++      if (voxel_num[0] >= max_voxels) continue;
++      voxel_num[0] += 1;
++      coor_to_voxelidx[i] = voxelidx;
++      num_points_per_voxel[voxelidx] = 1;
++    } else {
++      int point_idx = point_to_pointidx[i];
++      int voxelidx = coor_to_voxelidx[point_idx];
++      if (voxelidx != -1) {
++        coor_to_voxelidx[i] = voxelidx;
++        num_points_per_voxel[voxelidx] += 1;
++      }
++    }
++  }
++}
++
++__global__ void nondisterministic_get_assign_pos(
++    const int nthreads, const int32_t *coors_map, int32_t *pts_id,
++    int32_t *coors_count, int32_t *reduce_count, int32_t *coors_order) {
++  CUDA_1D_KERNEL_LOOP(thread_idx, nthreads) {
++    int coors_idx = coors_map[thread_idx];
++    if (coors_idx > -1) {
++      int32_t coors_pts_pos = atomicAdd(&reduce_count[coors_idx], 1);
++      pts_id[thread_idx] = coors_pts_pos;
++      if (coors_pts_pos == 0) {
++        coors_order[coors_idx] = atomicAdd(coors_count, 1);
++      }
++    }
++  }
++}
++
++template<typename T>
++__global__ void nondisterministic_assign_point_voxel(
++    const int nthreads, const T *points, const int32_t *coors_map,
++    const int32_t *pts_id, const int32_t *coors_in,
++    const int32_t *reduce_count, const int32_t *coors_order,
++    T *voxels, int32_t *coors, int32_t *pts_count, const int max_voxels,
++    const int max_points, const int num_features, const int NDim) {
++  CUDA_1D_KERNEL_LOOP(thread_idx, nthreads) {
++    int coors_idx = coors_map[thread_idx];
++    int coors_pts_pos = pts_id[thread_idx];
++    if (coors_idx > -1) {
++      int coors_pos = coors_order[coors_idx];
++      if (coors_pos < max_voxels && coors_pts_pos < max_points) {
++        auto voxels_offset =
++            voxels + (coors_pos * max_points + coors_pts_pos) * num_features;
++        auto points_offset = points + thread_idx * num_features;
++        for (int k = 0; k < num_features; k++) {
++          voxels_offset[k] = points_offset[k];
++        }
++        if (coors_pts_pos == 0) {
++          pts_count[coors_pos] = min(reduce_count[coors_idx], max_points);
++          auto coors_offset = coors + coors_pos * NDim;
++          auto coors_in_offset = coors_in + coors_idx * NDim;
++          for (int k = 0; k < NDim; k++) {
++            coors_offset[k] = coors_in_offset[k];
++          }
++        }
++      }
++    }
++  }
++}
++
++namespace voxelization {
++
++int hard_voxelize_gpu(const at::Tensor& points, at::Tensor& voxels,
++                      at::Tensor& coors, at::Tensor& num_points_per_voxel,
++                      const std::vector<float> voxel_size,
++                      const std::vector<float> coors_range,
++                      const int max_points, const int max_voxels,
++                      const int NDim = 3) {
++  // current version tooks about 0.04s for one frame on cpu
++  // check device
++  CHECK_INPUT(points);
++
++  at::cuda::CUDAGuard device_guard(points.device());
++
++  const int num_points = points.size(0);
++  const int num_features = points.size(1);
++
++  const float voxel_x = voxel_size[0];
++  const float voxel_y = voxel_size[1];
++  const float voxel_z = voxel_size[2];
++  const float coors_x_min = coors_range[0];
++  const float coors_y_min = coors_range[1];
++  const float coors_z_min = coors_range[2];
++  const float coors_x_max = coors_range[3];
++  const float coors_y_max = coors_range[4];
++  const float coors_z_max = coors_range[5];
++
++  const int grid_x = round((coors_x_max - coors_x_min) / voxel_x);
++  const int grid_y = round((coors_y_max - coors_y_min) / voxel_y);
++  const int grid_z = round((coors_z_max - coors_z_min) / voxel_z);
++
++  // map points to voxel coors
++  at::Tensor temp_coors =
++      at::zeros({num_points, NDim}, points.options().dtype(at::kInt));
++
++  dim3 grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
++  dim3 block(512);
++
++  // 1. link point to corresponding voxel coors
++  AT_DISPATCH_ALL_TYPES(
++      points.scalar_type(), "hard_voxelize_kernel", ([&] {
++        dynamic_voxelize_kernel<scalar_t, int>
++            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
++                points.contiguous().data_ptr<scalar_t>(),
++                temp_coors.contiguous().data_ptr<int>(), voxel_x, voxel_y,
++                voxel_z, coors_x_min, coors_y_min, coors_z_min, coors_x_max,
++                coors_y_max, coors_z_max, grid_x, grid_y, grid_z, num_points,
++                num_features, NDim);
++      }));
++  cudaDeviceSynchronize();
++  AT_CUDA_CHECK(cudaGetLastError());
++
++  // 2. map point to the idx of the corresponding voxel, find duplicate coor
++  // create some temporary variables
++  auto point_to_pointidx = -at::ones(
++      {
++          num_points,
++      },
++      points.options().dtype(at::kInt));
++  auto point_to_voxelidx = -at::ones(
++      {
++          num_points,
++      },
++      points.options().dtype(at::kInt));
++
++  dim3 map_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
++  dim3 map_block(512);
++  AT_DISPATCH_ALL_TYPES(
++      temp_coors.scalar_type(), "determin_duplicate", ([&] {
++        point_to_voxelidx_kernel<int>
++            <<<map_grid, map_block, 0, at::cuda::getCurrentCUDAStream()>>>(
++                temp_coors.contiguous().data_ptr<int>(),
++                point_to_voxelidx.contiguous().data_ptr<int>(),
++                point_to_pointidx.contiguous().data_ptr<int>(), max_points,
++                max_voxels, num_points, NDim);
++      }));
++  cudaDeviceSynchronize();
++  AT_CUDA_CHECK(cudaGetLastError());
++
++  // 3. determin voxel num and voxel's coor index
++  // make the logic in the CUDA device could accelerate about 10 times
++  auto coor_to_voxelidx = -at::ones(
++      {
++          num_points,
++      },
++      points.options().dtype(at::kInt));
++  auto voxel_num = at::zeros(
++      {
++          1,
++      },
++      points.options().dtype(at::kInt));  // must be zero from the begining
++
++  AT_DISPATCH_ALL_TYPES(
++      temp_coors.scalar_type(), "determin_duplicate", ([&] {
++        determin_voxel_num<int><<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
++            num_points_per_voxel.contiguous().data_ptr<int>(),
++            point_to_voxelidx.contiguous().data_ptr<int>(),
++            point_to_pointidx.contiguous().data_ptr<int>(),
++            coor_to_voxelidx.contiguous().data_ptr<int>(),
++            voxel_num.contiguous().data_ptr<int>(), max_points, max_voxels,
++            num_points);
++      }));
++  cudaDeviceSynchronize();
++  AT_CUDA_CHECK(cudaGetLastError());
++
++  // 4. copy point features to voxels
++  // Step 4 & 5 could be parallel
++  auto pts_output_size = num_points * num_features;
++  dim3 cp_grid(std::min(at::cuda::ATenCeilDiv(pts_output_size, 512), 4096));
++  dim3 cp_block(512);
++  AT_DISPATCH_ALL_TYPES(
++      points.scalar_type(), "assign_point_to_voxel", ([&] {
++        assign_point_to_voxel<float, int>
++            <<<cp_grid, cp_block, 0, at::cuda::getCurrentCUDAStream()>>>(
++                pts_output_size, points.contiguous().data_ptr<float>(),
++                point_to_voxelidx.contiguous().data_ptr<int>(),
++                coor_to_voxelidx.contiguous().data_ptr<int>(),
++                voxels.contiguous().data_ptr<float>(), max_points, num_features,
++                num_points, NDim);
++      }));
++  //   cudaDeviceSynchronize();
++  //   AT_CUDA_CHECK(cudaGetLastError());
++
++  // 5. copy coors of each voxels
++  auto coors_output_size = num_points * NDim;
++  dim3 coors_cp_grid(
++      std::min(at::cuda::ATenCeilDiv(coors_output_size, 512), 4096));
++  dim3 coors_cp_block(512);
++  AT_DISPATCH_ALL_TYPES(
++      points.scalar_type(), "assign_point_to_voxel", ([&] {
++        assign_voxel_coors<float, int><<<coors_cp_grid, coors_cp_block, 0,
++                                         at::cuda::getCurrentCUDAStream()>>>(
++            coors_output_size, temp_coors.contiguous().data_ptr<int>(),
++            point_to_voxelidx.contiguous().data_ptr<int>(),
++            coor_to_voxelidx.contiguous().data_ptr<int>(),
++            coors.contiguous().data_ptr<int>(), num_points, NDim);
++      }));
++  cudaDeviceSynchronize();
++  AT_CUDA_CHECK(cudaGetLastError());
++
++  auto voxel_num_cpu = voxel_num.to(at::kCPU);
++  int voxel_num_int = voxel_num_cpu.data_ptr<int>()[0];
++
++  return voxel_num_int;
++}
++
++int nondisterministic_hard_voxelize_gpu(
++    const at::Tensor &points, at::Tensor &voxels,
++    at::Tensor &coors, at::Tensor &num_points_per_voxel,
++    const std::vector<float> voxel_size,
++    const std::vector<float> coors_range,
++    const int max_points, const int max_voxels,
++    const int NDim = 3) {
++
++  CHECK_INPUT(points);
++
++  at::cuda::CUDAGuard device_guard(points.device());
++
++  const int num_points = points.size(0);
++  const int num_features = points.size(1);
++
++  if (num_points == 0)
++    return 0;
++
++  const float voxel_x = voxel_size[0];
++  const float voxel_y = voxel_size[1];
++  const float voxel_z = voxel_size[2];
++  const float coors_x_min = coors_range[0];
++  const float coors_y_min = coors_range[1];
++  const float coors_z_min = coors_range[2];
++  const float coors_x_max = coors_range[3];
++  const float coors_y_max = coors_range[4];
++  const float coors_z_max = coors_range[5];
++
++  const int grid_x = round((coors_x_max - coors_x_min) / voxel_x);
++  const int grid_y = round((coors_y_max - coors_y_min) / voxel_y);
++  const int grid_z = round((coors_z_max - coors_z_min) / voxel_z);
++
++  // map points to voxel coors
++  at::Tensor temp_coors =
++      at::zeros({num_points, NDim}, points.options().dtype(torch::kInt32));
++
++  dim3 grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
++  dim3 block(512);
++
++  // 1. link point to corresponding voxel coors
++  AT_DISPATCH_ALL_TYPES(
++      points.scalar_type(), "hard_voxelize_kernel", ([&] {
++    dynamic_voxelize_kernel<scalar_t, int>
++    <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
++        points.contiguous().data_ptr<scalar_t>(),
++        temp_coors.contiguous().data_ptr<int>(), voxel_x, voxel_y,
++        voxel_z, coors_x_min, coors_y_min, coors_z_min, coors_x_max,
++        coors_y_max, coors_z_max, grid_x, grid_y, grid_z, num_points,
++        num_features, NDim);
++  }));
++
++  at::Tensor coors_map;
++  at::Tensor coors_count;
++  at::Tensor coors_order;
++  at::Tensor reduce_count;
++  at::Tensor pts_id;
++
++  auto coors_clean = temp_coors.masked_fill(temp_coors.lt(0).any(-1, true), -1);
++
++  std::tie(temp_coors, coors_map, reduce_count) =
++      at::unique_dim(coors_clean, 0, true, true, false);
++
++  if (temp_coors.index({0, 0}).lt(0).item<bool>()) {
++    // the first element of temp_coors is (-1,-1,-1) and should be removed
++    temp_coors = temp_coors.slice(0, 1);
++    coors_map = coors_map - 1;
++  }
++
++  int num_coors = temp_coors.size(0);
++  temp_coors = temp_coors.to(torch::kInt32);
++  coors_map = coors_map.to(torch::kInt32);
++
++  coors_count = coors_map.new_zeros(1);
++  coors_order = coors_map.new_empty(num_coors);
++  reduce_count = coors_map.new_zeros(num_coors);
++  pts_id = coors_map.new_zeros(num_points);
++
++  dim3 cp_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
++  dim3 cp_block(512);
++  AT_DISPATCH_ALL_TYPES(points.scalar_type(), "get_assign_pos", ([&] {
++    nondisterministic_get_assign_pos<<<cp_grid, cp_block, 0,
++    at::cuda::getCurrentCUDAStream()>>>(
++        num_points,
++        coors_map.contiguous().data_ptr<int32_t>(),
++        pts_id.contiguous().data_ptr<int32_t>(),
++        coors_count.contiguous().data_ptr<int32_t>(),
++        reduce_count.contiguous().data_ptr<int32_t>(),
++        coors_order.contiguous().data_ptr<int32_t>());
++  }));
++
++  AT_DISPATCH_ALL_TYPES(
++      points.scalar_type(), "assign_point_to_voxel", ([&] {
++    nondisterministic_assign_point_voxel<scalar_t>
++    <<<cp_grid, cp_block, 0, at::cuda::getCurrentCUDAStream()>>>(
++        num_points, points.contiguous().data_ptr<scalar_t>(),
++        coors_map.contiguous().data_ptr<int32_t>(),
++        pts_id.contiguous().data_ptr<int32_t>(),
++        temp_coors.contiguous().data_ptr<int32_t>(),
++        reduce_count.contiguous().data_ptr<int32_t>(),
++        coors_order.contiguous().data_ptr<int32_t>(),
++        voxels.contiguous().data_ptr<scalar_t>(),
++        coors.contiguous().data_ptr<int32_t>(),
++        num_points_per_voxel.contiguous().data_ptr<int32_t>(),
++        max_voxels, max_points,
++        num_features, NDim);
++  }));
++  AT_CUDA_CHECK(cudaGetLastError());
++  return max_voxels < num_coors ? max_voxels : num_coors;
++}
++
++void dynamic_voxelize_gpu(const at::Tensor& points, at::Tensor& coors,
++                          const std::vector<float> voxel_size,
++                          const std::vector<float> coors_range,
++                          const int NDim = 3) {
++  // current version tooks about 0.04s for one frame on cpu
++  // check device
++  CHECK_INPUT(points);
++
++  at::cuda::CUDAGuard device_guard(points.device());
++
++  const int num_points = points.size(0);
++  const int num_features = points.size(1);
++
++  const float voxel_x = voxel_size[0];
++  const float voxel_y = voxel_size[1];
++  const float voxel_z = voxel_size[2];
++  const float coors_x_min = coors_range[0];
++  const float coors_y_min = coors_range[1];
++  const float coors_z_min = coors_range[2];
++  const float coors_x_max = coors_range[3];
++  const float coors_y_max = coors_range[4];
++  const float coors_z_max = coors_range[5];
++
++  const int grid_x = round((coors_x_max - coors_x_min) / voxel_x);
++  const int grid_y = round((coors_y_max - coors_y_min) / voxel_y);
++  const int grid_z = round((coors_z_max - coors_z_min) / voxel_z);
++
++  const int col_blocks = at::cuda::ATenCeilDiv(num_points, threadsPerBlock);
++  dim3 blocks(col_blocks);
++  dim3 threads(threadsPerBlock);
++  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++
++  AT_DISPATCH_ALL_TYPES(points.scalar_type(), "dynamic_voxelize_kernel", [&] {
++    dynamic_voxelize_kernel<scalar_t, int><<<blocks, threads, 0, stream>>>(
++        points.contiguous().data_ptr<scalar_t>(),
++        coors.contiguous().data_ptr<int>(), voxel_x, voxel_y, voxel_z,
++        coors_x_min, coors_y_min, coors_z_min, coors_x_max, coors_y_max,
++        coors_z_max, grid_x, grid_y, grid_z, num_points, num_features, NDim);
++  });
++  cudaDeviceSynchronize();
++  AT_CUDA_CHECK(cudaGetLastError());
++
++  return;
++}
++
++}  // namespace voxelization
+diff --git a/mmdet3d/ops/voxel/voxelize.py b/mmdet3d/ops/voxel/voxelize.py
+index 229c723..3fa4a37 100644
+--- a/mmdet3d/ops/voxel/voxelize.py
++++ b/mmdet3d/ops/voxel/voxelize.py
+@@ -7,11 +7,28 @@ from torch.nn.modules.utils import _pair
+ from .voxel_layer import dynamic_voxelize, hard_voxelize
+ 
+ 
+-class _Voxelization(Function):
+-    @staticmethod
+-    def forward(
+-        ctx, points, voxel_size, coors_range, max_points=35, max_voxels=20000, deterministic=True
+-    ):
++# class _Voxelization(Function):
++
++#     @staticmethod
++#     def forward(ctx,
++#                 points,
++#                 voxel_size,
++#                 coors_range,
++#                 max_points=35,
++#                 max_voxels=20000,
++#                 deterministic=True):
++# zzj api 20220224
++# : change class _Voxelization(Function) which only define forward 
++# to def _Voxelization
++# enables the auto backward . 
++def _Voxelization(
++                # ctx,
++                points,
++                voxel_size,
++                coors_range,
++                max_points=35,
++                max_voxels=20000,
++                deterministic=True):
+         """convert kitti points(N, >=3) to voxels.
+ 
+         Args:
+@@ -49,35 +66,87 @@ class _Voxelization(Function):
+             dynamic_voxelize(points, coors, voxel_size, coors_range, 3)
+             return coors
+         else:
+-            voxels = points.new_zeros(size=(max_voxels, max_points, points.size(1)))
++            voxels = points.new_zeros(
++                size=(max_voxels, max_points, points.size(1)))
+             coors = points.new_zeros(size=(max_voxels, 3), dtype=torch.int)
+-            num_points_per_voxel = points.new_zeros(size=(max_voxels,), dtype=torch.int)
+-            voxel_num = hard_voxelize(
+-                points,
+-                voxels,
+-                coors,
+-                num_points_per_voxel,
+-                voxel_size,
+-                coors_range,
+-                max_points,
+-                max_voxels,
+-                3,
+-                deterministic,
+-            )
+-            # select the valid voxels
+-            voxels_out = voxels[:voxel_num]
++            num_points_per_voxel = points.new_zeros(
++                size=(max_voxels, ), dtype=torch.int)
++            
++
++            # ==================== old =====================
++            # voxel_num = hard_voxelize(points, voxels, coors,
++            #                           num_points_per_voxel, voxel_size,
++            #                           coors_range, max_points, max_voxels, 3,
++            #                           deterministic)
++            # # select the valid voxels
++            # voxels_out = voxels[:voxel_num]
++            # coors_out = coors[:voxel_num]
++            # num_points_per_voxel_out = num_points_per_voxel[:voxel_num]
++            # return voxels_out, coors_out, num_points_per_voxel_out
++
++            # ==================== new =====================
++            # zzj api 20220224
++            # change .cu code and recomplie to get some idx we need 
++            # only in c code.
++            point_to_pointidx = points.new_zeros(size=(points.size(0),)).fill_(-1).int()
++            point_to_voxelidx = points.new_zeros(size=(points.size(0),)).fill_(-1).int()
++            coor_to_voxelidx = points.new_zeros(size=(points.size(0),)).fill_(-1).int()
++
++            # 这个函数的作用是把point填到一个一个voxel里面，
++            # 多余point丢掉，不足的补零
++            voxel_num = hard_voxelize(points, voxels, coors,
++                                      num_points_per_voxel, voxel_size,
++                                      coors_range, max_points, max_voxels,
++                                      point_to_pointidx, # 当前点对应的voxel（坐标）中，第一个出现的点的序号
++                                      point_to_voxelidx, # 当前点对应的voxel中，当前点的index [point_to_idxinvoxel]
++                                      coor_to_voxelidx,  # 当前点的voxel（坐标），对应的voxel的序号 [point_to_voxelidx]
++                                      3,
++                                      deterministic)
++
++            valid_index = (point_to_voxelidx>-1)*(coor_to_voxelidx>-1)
++            point_to_voxelidx_valid = point_to_voxelidx[valid_index]
++            coor_to_voxelidx_valid = coor_to_voxelidx[valid_index]
++            points_valid = points[valid_index]
++
++            voxelidx_tensor = coor_to_voxelidx_valid
++            num_tensor = point_to_voxelidx_valid
++            
++            #### 这部分笔记没有用！！！！！
++            # 需要一个按位置填入的函数
++            # 可以建立一个单词本，把空的地方按照000单词填入，看看行不行
++            # 那么首先就要确定输出的tensor大小，序号tensor的大小：(max_voxels, max_points)
++            # 在这里做文章就够了吧，根据之前已有的index把point填进去的时候，多填几次就行
++            # 关键是判断朝上填还是朝下填，在xyz三个轴上
++
++            voxels_new = torch.cuda.FloatTensor(
++                size=(max_voxels, max_points, points.size(1))).fill_(0)
++            voxels_new_line = voxels_new.view(-1,points.size(1))
++            voxels_new_line[(voxelidx_tensor*max_points+num_tensor).long()] = points_valid
++            voxels_new = voxels_new_line.view(max_voxels, max_points, points.size(1))
++
++            voxels_out = voxels_new[:voxel_num]
++            # voxels_out = voxels[:voxel_num]
+             coors_out = coors[:voxel_num]
+             num_points_per_voxel_out = num_points_per_voxel[:voxel_num]
+             return voxels_out, coors_out, num_points_per_voxel_out
++            
+ 
+ 
+-voxelization = _Voxelization.apply
++# zzj api 20220224
++# to make def _Voxelization() works 
++# change this code
++# voxelization = _Voxelization.apply
++voxelization = _Voxelization
+ 
+ 
+ class Voxelization(nn.Module):
+-    def __init__(
+-        self, voxel_size, point_cloud_range, max_num_points, max_voxels=20000, deterministic=True
+-    ):
++
++    def __init__(self,
++                 voxel_size,
++                 point_cloud_range,
++                 max_num_points,
++                 max_voxels=20000,
++                 deterministic=True):
+         super(Voxelization, self).__init__()
+         """
+         Args:
+@@ -107,10 +176,12 @@ class Voxelization(nn.Module):
+             self.max_voxels = _pair(max_voxels)
+         self.deterministic = deterministic
+ 
+-        point_cloud_range = torch.tensor(point_cloud_range, dtype=torch.float32)
++        point_cloud_range = torch.tensor(
++            point_cloud_range, dtype=torch.float32)
+         # [0, -40, -3, 70.4, 40, 1]
+         voxel_size = torch.tensor(voxel_size, dtype=torch.float32)
+-        grid_size = (point_cloud_range[3:] - point_cloud_range[:3]) / voxel_size
++        grid_size = (point_cloud_range[3:] -
++                     point_cloud_range[:3]) / voxel_size
+         grid_size = torch.round(grid_size).long()
+         input_feat_shape = grid_size[:2]
+         self.grid_size = grid_size
+@@ -128,21 +199,16 @@ class Voxelization(nn.Module):
+         else:
+             max_voxels = self.max_voxels[1]
+ 
+-        return voxelization(
+-            input,
+-            self.voxel_size,
+-            self.point_cloud_range,
+-            self.max_num_points,
+-            max_voxels,
+-            self.deterministic,
+-        )
++        return voxelization(input, self.voxel_size, self.point_cloud_range,
++                            self.max_num_points, max_voxels,
++                            self.deterministic)
+ 
+     def __repr__(self):
+-        tmpstr = self.__class__.__name__ + "("
+-        tmpstr += "voxel_size=" + str(self.voxel_size)
+-        tmpstr += ", point_cloud_range=" + str(self.point_cloud_range)
+-        tmpstr += ", max_num_points=" + str(self.max_num_points)
+-        tmpstr += ", max_voxels=" + str(self.max_voxels)
+-        tmpstr += ", deterministic=" + str(self.deterministic)
+-        tmpstr += ")"
++        tmpstr = self.__class__.__name__ + '('
++        tmpstr += 'voxel_size=' + str(self.voxel_size)
++        tmpstr += ', point_cloud_range=' + str(self.point_cloud_range)
++        tmpstr += ', max_num_points=' + str(self.max_num_points)
++        tmpstr += ', max_voxels=' + str(self.max_voxels)
++        tmpstr += ', deterministic=' + str(self.deterministic)
++        tmpstr += ')'
+         return tmpstr
+diff --git a/mmdet3d/ops/voxel/voxelize_backup.py b/mmdet3d/ops/voxel/voxelize_backup.py
+new file mode 100644
+index 0000000..229c723
+--- /dev/null
++++ b/mmdet3d/ops/voxel/voxelize_backup.py
+@@ -0,0 +1,148 @@
++# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
++import torch
++from torch import nn
++from torch.autograd import Function
++from torch.nn.modules.utils import _pair
++
++from .voxel_layer import dynamic_voxelize, hard_voxelize
++
++
++class _Voxelization(Function):
++    @staticmethod
++    def forward(
++        ctx, points, voxel_size, coors_range, max_points=35, max_voxels=20000, deterministic=True
++    ):
++        """convert kitti points(N, >=3) to voxels.
++
++        Args:
++            points: [N, ndim] float tensor. points[:, :3] contain xyz points
++                and points[:, 3:] contain other information like reflectivity
++            voxel_size: [3] list/tuple or array, float. xyz, indicate voxel
++                size
++            coors_range: [6] list/tuple or array, float. indicate voxel
++                range. format: xyzxyz, minmax
++            max_points: int. indicate maximum points contained in a voxel. if
++                max_points=-1, it means using dynamic_voxelize
++            max_voxels: int. indicate maximum voxels this function create.
++                for second, 20000 is a good choice. Users should shuffle points
++                before call this function because max_voxels may drop points.
++            deterministic: bool. whether to invoke the non-deterministic
++                version of hard-voxelization implementations. non-deterministic
++                version is considerablly fast but is not deterministic. only
++                affects hard voxelization. default True. for more information
++                of this argument and the implementation insights, please refer
++                to the following links:
++                https://github.com/open-mmlab/mmdetection3d/issues/894
++                https://github.com/open-mmlab/mmdetection3d/pull/904
++                it is an experimental feature and we will appreciate it if
++                you could share with us the failing cases.
++
++        Returns:
++            voxels: [M, max_points, ndim] float tensor. only contain points
++                    and returned when max_points != -1.
++            coordinates: [M, 3] int32 tensor, always returned.
++            num_points_per_voxel: [M] int32 tensor. Only returned when
++                max_points != -1.
++        """
++        if max_points == -1 or max_voxels == -1:
++            coors = points.new_zeros(size=(points.size(0), 3), dtype=torch.int)
++            dynamic_voxelize(points, coors, voxel_size, coors_range, 3)
++            return coors
++        else:
++            voxels = points.new_zeros(size=(max_voxels, max_points, points.size(1)))
++            coors = points.new_zeros(size=(max_voxels, 3), dtype=torch.int)
++            num_points_per_voxel = points.new_zeros(size=(max_voxels,), dtype=torch.int)
++            voxel_num = hard_voxelize(
++                points,
++                voxels,
++                coors,
++                num_points_per_voxel,
++                voxel_size,
++                coors_range,
++                max_points,
++                max_voxels,
++                3,
++                deterministic,
++            )
++            # select the valid voxels
++            voxels_out = voxels[:voxel_num]
++            coors_out = coors[:voxel_num]
++            num_points_per_voxel_out = num_points_per_voxel[:voxel_num]
++            return voxels_out, coors_out, num_points_per_voxel_out
++
++
++voxelization = _Voxelization.apply
++
++
++class Voxelization(nn.Module):
++    def __init__(
++        self, voxel_size, point_cloud_range, max_num_points, max_voxels=20000, deterministic=True
++    ):
++        super(Voxelization, self).__init__()
++        """
++        Args:
++            voxel_size (list): list [x, y, z] size of three dimension
++            point_cloud_range (list):
++                [x_min, y_min, z_min, x_max, y_max, z_max]
++            max_num_points (int): max number of points per voxel
++            max_voxels (tuple or int): max number of voxels in
++                (training, testing) time
++            deterministic: bool. whether to invoke the non-deterministic
++                version of hard-voxelization implementations. non-deterministic
++                version is considerablly fast but is not deterministic. only
++                affects hard voxelization. default True. for more information
++                of this argument and the implementation insights, please refer
++                to the following links:
++                https://github.com/open-mmlab/mmdetection3d/issues/894
++                https://github.com/open-mmlab/mmdetection3d/pull/904
++                it is an experimental feature and we will appreciate it if
++                you could share with us the failing cases.
++        """
++        self.voxel_size = voxel_size
++        self.point_cloud_range = point_cloud_range
++        self.max_num_points = max_num_points
++        if isinstance(max_voxels, tuple):
++            self.max_voxels = max_voxels
++        else:
++            self.max_voxels = _pair(max_voxels)
++        self.deterministic = deterministic
++
++        point_cloud_range = torch.tensor(point_cloud_range, dtype=torch.float32)
++        # [0, -40, -3, 70.4, 40, 1]
++        voxel_size = torch.tensor(voxel_size, dtype=torch.float32)
++        grid_size = (point_cloud_range[3:] - point_cloud_range[:3]) / voxel_size
++        grid_size = torch.round(grid_size).long()
++        input_feat_shape = grid_size[:2]
++        self.grid_size = grid_size
++        # the origin shape is as [x-len, y-len, z-len]
++        # [w, h, d] -> [d, h, w] removed
++        self.pcd_shape = [*input_feat_shape, 1]#[::-1]
++
++    def forward(self, input):
++        """
++        Args:
++            input: NC points
++        """
++        if self.training:
++            max_voxels = self.max_voxels[0]
++        else:
++            max_voxels = self.max_voxels[1]
++
++        return voxelization(
++            input,
++            self.voxel_size,
++            self.point_cloud_range,
++            self.max_num_points,
++            max_voxels,
++            self.deterministic,
++        )
++
++    def __repr__(self):
++        tmpstr = self.__class__.__name__ + "("
++        tmpstr += "voxel_size=" + str(self.voxel_size)
++        tmpstr += ", point_cloud_range=" + str(self.point_cloud_range)
++        tmpstr += ", max_num_points=" + str(self.max_num_points)
++        tmpstr += ", max_voxels=" + str(self.max_voxels)
++        tmpstr += ", deterministic=" + str(self.deterministic)
++        tmpstr += ")"
++        return tmpstr
+diff --git a/tools/test_fgsm_img_launcher.py b/tools/test_fgsm_img_launcher.py
+new file mode 100644
+index 0000000..f2b71b1
+--- /dev/null
++++ b/tools/test_fgsm_img_launcher.py
+@@ -0,0 +1,235 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis_common.test_fgsm_img import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('eps255', help='eps of fgsm')
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    # assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++    #     "Please specify at least one operation (save/eval/format/show the "
++    #     'results / save the results) with the argument "--out", "--eval"'
++    #     ', "--format-only", "--show" or "--show-dir"'
++    # )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    # distributed = True
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"), train_cfg=cfg.get("train_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if "CLASSES" in checkpoint.get("meta", {}):
++        model.CLASSES = checkpoint["meta"]["CLASSES"]
++    else:
++        model.CLASSES = dataset.CLASSES
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader, 
++                                    args.scattered_result_prefix,
++                                    args.eps255,
++                                )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False,
++        )
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_patch_class_launcher.py b/tools/test_patch_class_launcher.py
+new file mode 100644
+index 0000000..356c11f
+--- /dev/null
++++ b/tools/test_patch_class_launcher.py
+@@ -0,0 +1,238 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis_common.test_patch_class import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('patch_save_prefix', help='save patch_save file dir')
++    parser.add_argument('area_rate_str', help='area rate of patch')
++    parser.add_argument('optim_lr', help='optim_lr of attack')
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    # assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++    #     "Please specify at least one operation (save/eval/format/show the "
++    #     'results / save the results) with the argument "--out", "--eval"'
++    #     ', "--format-only", "--show" or "--show-dir"'
++    # )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++    # print(cfg)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    # distributed = True
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"), train_cfg=cfg.get("train_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if "CLASSES" in checkpoint.get("meta", {}):
++        model.CLASSES = checkpoint["meta"]["CLASSES"]
++    else:
++        model.CLASSES = dataset.CLASSES
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.patch_save_prefix,
++                                  args.area_rate_str,
++                                  args.optim_lr
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False,
++        )
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_patch_instance_launcher.py b/tools/test_patch_instance_launcher.py
+new file mode 100644
+index 0000000..1fe907b
+--- /dev/null
++++ b/tools/test_patch_instance_launcher.py
+@@ -0,0 +1,238 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis_common.test_patch_instance import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('mask_code', help='mask area of instance patch')
++    parser.add_argument('step', help='step of attack')
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    # assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++    #     "Please specify at least one operation (save/eval/format/show the "
++    #     'results / save the results) with the argument "--out", "--eval"'
++    #     ', "--format-only", "--show" or "--show-dir"'
++    # )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++    # print(cfg)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    # distributed = True
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"), train_cfg=cfg.get("train_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if "CLASSES" in checkpoint.get("meta", {}):
++        model.CLASSES = checkpoint["meta"]["CLASSES"]
++    else:
++        model.CLASSES = dataset.CLASSES
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.mask_code,
++                                  args.step
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False,
++        )
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_patch_overlap_launcher.py b/tools/test_patch_overlap_launcher.py
+new file mode 100644
+index 0000000..ba5da40
+--- /dev/null
++++ b/tools/test_patch_overlap_launcher.py
+@@ -0,0 +1,240 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis_common.test_patch_overlap import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('area_rate_str', help='area rate of patch')
++    parser.add_argument('optim_lr', help='optim_lr of attack')
++    parser.add_argument('optim_step', help='optim_lr of attack')
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    # assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++    #     "Please specify at least one operation (save/eval/format/show the "
++    #     'results / save the results) with the argument "--out", "--eval"'
++    #     ', "--format-only", "--show" or "--show-dir"'
++    # )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++    # print(cfg)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    # distributed = True
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"), train_cfg=cfg.get("train_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if "CLASSES" in checkpoint.get("meta", {}):
++        model.CLASSES = checkpoint["meta"]["CLASSES"]
++    else:
++        model.CLASSES = dataset.CLASSES
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.area_rate_str,
++                                  args.optim_lr,
++                                  args.optim_step
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False,
++        )
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_patch_temporal_launcher.py b/tools/test_patch_temporal_launcher.py
+new file mode 100644
+index 0000000..dcf4a14
+--- /dev/null
++++ b/tools/test_patch_temporal_launcher.py
+@@ -0,0 +1,244 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis_common.test_patch_temporal import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('area_rate_str', help='area rate of patch')
++    parser.add_argument('optim_lr', help='optim_lr of attack')
++    parser.add_argument('optim_step', help='optim_lr of attack')
++    parser.add_argument('--index-min', type=int, default=0)      # for multi-gpu split dataset
++    parser.add_argument('--index-max', type=int, default=100000) # for multi-gpu split dataset
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    # assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++    #     "Please specify at least one operation (save/eval/format/show the "
++    #     'results / save the results) with the argument "--out", "--eval"'
++    #     ', "--format-only", "--show" or "--show-dir"'
++    # )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++    # print(cfg)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    # distributed = True
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"), train_cfg=cfg.get("train_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if "CLASSES" in checkpoint.get("meta", {}):
++        model.CLASSES = checkpoint["meta"]["CLASSES"]
++    else:
++        model.CLASSES = dataset.CLASSES
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.area_rate_str,
++                                  args.optim_lr,
++                                  args.optim_step,
++                                  args.index_min,
++                                  args.index_max,
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False,
++        )
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_pgd_img_launcher.py b/tools/test_pgd_img_launcher.py
+new file mode 100644
+index 0000000..a9b5b3e
+--- /dev/null
++++ b/tools/test_pgd_img_launcher.py
+@@ -0,0 +1,238 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis_common.test_pgd_img import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file dir')
++    parser.add_argument('eps255', help='eps of pgd')
++    parser.add_argument('step', help='step of pgd')
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    # assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++    #     "Please specify at least one operation (save/eval/format/show the "
++    #     'results / save the results) with the argument "--out", "--eval"'
++    #     ', "--format-only", "--show" or "--show-dir"'
++    # )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++    # print(cfg)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    # distributed = True
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"), train_cfg=cfg.get("train_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if "CLASSES" in checkpoint.get("meta", {}):
++        model.CLASSES = checkpoint["meta"]["CLASSES"]
++    else:
++        model.CLASSES = dataset.CLASSES
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader, 
++                                    args.scattered_result_prefix,
++                                    args.eps255,
++                                    args.step,
++                                )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False,
++        )
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_pgd_imgpoint_launcher.py b/tools/test_pgd_imgpoint_launcher.py
+new file mode 100644
+index 0000000..1b94c8e
+--- /dev/null
++++ b/tools/test_pgd_imgpoint_launcher.py
+@@ -0,0 +1,240 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis_common.test_pgd_imgpoint import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('scattered_result_prefix', help='save scattered_result file prefix')
++    parser.add_argument('img_eps255', help='eps of pgd in img in 0-255')
++    parser.add_argument('point_eps_m', help='eps of pgd in point in meter')
++    parser.add_argument('step', help='step of pgd')
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    # assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++    #     "Please specify at least one operation (save/eval/format/show the "
++    #     'results / save the results) with the argument "--out", "--eval"'
++    #     ', "--format-only", "--show" or "--show-dir"'
++    # )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++    # print(cfg)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    # distributed = True
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    # cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"), train_cfg=cfg.get("train_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    if args.fuse_conv_bn:
++        model = fuse_conv_bn(model)
++    # old versions did not save class info in checkpoints, this walkaround is
++    # for backward compatibility
++    if "CLASSES" in checkpoint.get("meta", {}):
++        model.CLASSES = checkpoint["meta"]["CLASSES"]
++    else:
++        model.CLASSES = dataset.CLASSES
++
++    if not distributed:
++        model = MMDataParallel(model, device_ids=[0])
++        outputs = single_gpu_test(model, data_loader,
++                                  args.scattered_result_prefix,
++                                  args.img_eps255,
++                                  args.point_eps_m,
++                                  args.step
++                                  )
++    else:
++        model = MMDistributedDataParallel(
++            model.cuda(),
++            device_ids=[torch.cuda.current_device()],
++            broadcast_buffers=False,
++        )
++        outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_scatterd_eval.py b/tools/test_scatterd_eval.py
+new file mode 100644
+index 0000000..c90c986
+--- /dev/null
++++ b/tools/test_scatterd_eval.py
+@@ -0,0 +1,239 @@
++import argparse
++import copy
++import os
++import warnings
++
++import mmcv
++import torch
++from torchpack.utils.config import configs
++from torchpack import distributed as dist
++from mmcv import Config, DictAction
++from mmcv.cnn import fuse_conv_bn
++from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint, wrap_fp16_model
++from mmdet3d.apis import single_gpu_test
++from mmdet3d.datasets import build_dataloader, build_dataset
++from mmdet3d.models import build_model
++from mmdet.apis import multi_gpu_test, set_random_seed
++from mmdet.datasets import replace_ImageToTensor
++from mmdet3d.utils import recursive_eval
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="MMDet test (and eval) a model")
++    parser.add_argument("config", help="test config file path")
++    # parser.add_argument("checkpoint", help="checkpoint file")
++    parser.add_argument('scattered_result_dir', help='save scattered_result file dir')
++    parser.add_argument("--out", help="output result file in pickle format")
++    parser.add_argument(
++        "--fuse-conv-bn",
++        action="store_true",
++        help="Whether to fuse conv and bn, this will slightly increase"
++        "the inference speed",
++    )
++    parser.add_argument(
++        "--format-only",
++        action="store_true",
++        help="Format the output results without perform evaluation. It is"
++        "useful when you want to format the result to a specific format and "
++        "submit it to the test server",
++    )
++    parser.add_argument(
++        "--eval",
++        type=str,
++        nargs="+",
++        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
++        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC',
++    )
++    parser.add_argument("--show", action="store_true", help="show results")
++    parser.add_argument("--show-dir", help="directory where results will be saved")
++    parser.add_argument(
++        "--gpu-collect",
++        action="store_true",
++        help="whether to use gpu to collect results.",
++    )
++    parser.add_argument(
++        "--tmpdir",
++        help="tmp directory used for collecting results from multiple "
++        "workers, available when gpu-collect is not specified",
++    )
++    parser.add_argument("--seed", type=int, default=0, help="random seed")
++    parser.add_argument(
++        "--deterministic",
++        action="store_true",
++        help="whether to set deterministic options for CUDNN backend.",
++    )
++    parser.add_argument(
++        "--cfg-options",
++        nargs="+",
++        action=DictAction,
++        help="override some settings in the used config, the key-value pair "
++        "in xxx=yyy format will be merged into config file. If the value to "
++        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
++        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
++        "Note that the quotation marks are necessary and that no white space "
++        "is allowed.",
++    )
++    parser.add_argument(
++        "--options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function (deprecate), "
++        "change to --eval-options instead.",
++    )
++    parser.add_argument(
++        "--eval-options",
++        nargs="+",
++        action=DictAction,
++        help="custom options for evaluation, the key-value pair in xxx=yyy "
++        "format will be kwargs for dataset.evaluate() function",
++    )
++    parser.add_argument(
++        "--launcher",
++        choices=["none", "pytorch", "slurm", "mpi"],
++        default="none",
++        help="job launcher",
++    )
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    if "LOCAL_RANK" not in os.environ:
++        os.environ["LOCAL_RANK"] = str(args.local_rank)
++
++    if args.options and args.eval_options:
++        raise ValueError(
++            "--options and --eval-options cannot be both specified, "
++            "--options is deprecated in favor of --eval-options"
++        )
++    if args.options:
++        warnings.warn("--options is deprecated in favor of --eval-options")
++        args.eval_options = args.options
++    return args
++
++
++def main():
++    args = parse_args()
++    # dist.init()
++
++    # torch.backends.cudnn.benchmark = True
++    # torch.cuda.set_device(dist.local_rank())
++
++    assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
++        "Please specify at least one operation (save/eval/format/show the "
++        'results / save the results) with the argument "--out", "--eval"'
++        ', "--format-only", "--show" or "--show-dir"'
++    )
++
++    if args.eval and args.format_only:
++        raise ValueError("--eval and --format_only cannot be both specified")
++
++    if args.out is not None and not args.out.endswith((".pkl", ".pickle")):
++        raise ValueError("The output file must be a pkl file.")
++
++    configs.load(args.config, recursive=True)
++    cfg = Config(recursive_eval(configs), filename=args.config)
++    # print(cfg)
++
++    if args.cfg_options is not None:
++        cfg.merge_from_dict(args.cfg_options)
++    # set cudnn_benchmark
++    if cfg.get("cudnn_benchmark", False):
++        torch.backends.cudnn.benchmark = True
++
++    cfg.model.pretrained = None
++    # in case the test dataset is concatenated
++    samples_per_gpu = 1
++    if isinstance(cfg.data.test, dict):
++        cfg.data.test.test_mode = True
++        samples_per_gpu = cfg.data.test.pop("samples_per_gpu", 1)
++        if samples_per_gpu > 1:
++            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
++            cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
++    elif isinstance(cfg.data.test, list):
++        for ds_cfg in cfg.data.test:
++            ds_cfg.test_mode = True
++        samples_per_gpu = max(
++            [ds_cfg.pop("samples_per_gpu", 1) for ds_cfg in cfg.data.test]
++        )
++        if samples_per_gpu > 1:
++            for ds_cfg in cfg.data.test:
++                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
++
++    # init distributed env first, since logger depends on the dist info.
++    distributed = False
++
++    # set random seeds
++    if args.seed is not None:
++        set_random_seed(args.seed, deterministic=args.deterministic)
++
++    # build the dataloader
++    dataset = build_dataset(cfg.data.test)
++    data_loader = build_dataloader(
++        dataset,
++        samples_per_gpu=samples_per_gpu,
++        workers_per_gpu=cfg.data.workers_per_gpu,
++        dist=distributed,
++        shuffle=False,
++    )
++
++    # build the model and load checkpoint
++    cfg.model.train_cfg = None
++    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
++    fp16_cfg = cfg.get("fp16", None)
++    if fp16_cfg is not None:
++        wrap_fp16_model(model)
++    # checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
++    # if args.fuse_conv_bn:
++    #     model = fuse_conv_bn(model)
++    # # old versions did not save class info in checkpoints, this walkaround is
++    # # for backward compatibility
++    # if "CLASSES" in checkpoint.get("meta", {}):
++    #     model.CLASSES = checkpoint["meta"]["CLASSES"]
++    # else:
++    #     model.CLASSES = dataset.CLASSES
++
++    # if not distributed:
++    #     model = MMDataParallel(model, device_ids=[0])
++    #     outputs = single_gpu_test(model, data_loader)
++    # else:
++    #     model = MMDistributedDataParallel(
++    #         model.cuda(),
++    #         device_ids=[torch.cuda.current_device()],
++    #         broadcast_buffers=False,
++    #     )
++    #     outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
++    
++    # 读取零散预测结果
++    output_dir = args.scattered_result_dir
++    outputs = []
++    for i in range(len(dataset)):
++        output_path = os.path.join(output_dir, str(i)+'.pkl')
++        output = mmcv.load(output_path)
++        outputs.append(output[0])
++
++    rank, _ = get_dist_info()
++    if rank == 0:
++        if args.out:
++            print(f"\nwriting results to {args.out}")
++            mmcv.dump(outputs, args.out)
++        kwargs = {} if args.eval_options is None else args.eval_options
++        if args.format_only:
++            dataset.format_results(outputs, **kwargs)
++        if args.eval:
++            eval_kwargs = cfg.get("evaluation", {}).copy()
++            # hard-code way to remove EvalHook args
++            for key in [
++                "interval",
++                "tmpdir",
++                "start",
++                "gpu_collect",
++                "save_best",
++                "rule",
++            ]:
++                eval_kwargs.pop(key, None)
++            eval_kwargs.update(dict(metric=args.eval, **kwargs))
++            print(dataset.evaluate(outputs, **eval_kwargs))
++
++
++if __name__ == "__main__":
++    main()
