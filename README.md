@@ -5,7 +5,13 @@ Offical code for CVPR 2023 Paper Understanding the Robustness of 3D Object Detec
 ## Repo Explaination
 For you and we can clearly see what have been changed by us, we link original repo as submodules and give you repo changes file: XXXX_changes.patch
 
-You can use these patch files like this (transfusion for example):
+First of all, you need to download all submodules:
+```
+git submodule update --init --recursive
+```
+
+
+Then, you can use these patch files like this (transfusion for example):
 ```bash
 cd TransFusion
 patch -p1 < ../transfusion_changes.patch
